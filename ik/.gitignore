@@ -140,8 +140,5 @@ AMENT_IGNORE
 
 # [comment]
 
-# [third-party]
-**/third_party
-
 # ignore 新文件后, 执行以下命令
 # git rm -r --cached . && git add .

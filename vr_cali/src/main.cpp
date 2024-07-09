@@ -6,10 +6,6 @@
 #include <map>
 #include <memory>
 #include <string>
-#include <tf2/LinearMath/Matrix3x3.h>
-#include <tf2/LinearMath/Transform.h>
-#include <tf2/LinearMath/Vector3.h>
-#include <tf2/convert.h>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -17,7 +13,11 @@
 #include <rclcpp/qos.hpp>
 #include <rclcpp/utilities.hpp>
 #include <std_msgs/msg/empty.hpp>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Transform.h>
+#include <tf2/LinearMath/Vector3.h>
+#include <tf2/convert.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/static_transform_broadcaster.h>
@@ -145,7 +145,7 @@ private:
     }
 
     void record_p0(const std_msgs::msg::Empty::SharedPtr msg) {
-        // 坐标表述 b => a 的平移量就是 a 表述下 b 的原点位置
+        // 同一点的表述 b => 表述 a 的平移量就是 a 表述下 b 的原点位置
         this->p0 = this->get_position("ref", "tracker_random");
         RCLCPP_INFO(this->get_logger(), "p0 has been set to %f %f %f", p0->x(), p0->y(), p0->z());
     }
