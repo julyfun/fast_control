@@ -20,8 +20,14 @@ ament_auto_find_build_dependencies()
 # [build]
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
-  src/main.cpp
+  # src/kdl.cpp
+  src/moveit.cpp
 )
+
+# [dep.system.ceres]
+find_package(Ceres REQUIRED)
+target_include_directories(${PROJECT_NAME} PUBLIC ${CERES_INCLUDE_DIRS})
+target_link_libraries(${PROJECT_NAME} ${CERES_LIBRARIES})
 
 # [dep.system.Poco]
 
@@ -56,8 +62,12 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/third_party/log4cplus/linux_x64/lib/
 
 # [register node]
 rclcpp_components_register_node(${PROJECT_NAME}
-  PLUGIN ik::Ik
-  EXECUTABLE ${PROJECT_NAME}_node
+  PLUGIN ik::kdl::Ik
+  EXECUTABLE ik_kdl_exe
+)
+rclcpp_components_register_node(${PROJECT_NAME}
+  PLUGIN ik::moveit::Ik
+  EXECUTABLE ik_moveit_exe
 )
 
 # [testing]
@@ -81,5 +91,6 @@ endif()
 
 ament_auto_package(
   INSTALL_TO_SHARE
+  config
 )
 

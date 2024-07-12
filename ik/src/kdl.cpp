@@ -1,21 +1,17 @@
 // #include "tf_test/tf_test.hpp"
 // C++ system
 #include <cmath>
-#include <cstdint>
-#include <functional>
-#include <kdl/jntarray.hpp>
-#include <map>
 #include <memory>
 #include <string>
-#include <vector>
 
-#include "AuboRobotMetaType.h"
+#include <AuboRobotMetaType.h>
 #include <geometry_msgs/msg/pose.hpp>
 #include <kdl/chain.hpp>
 #include <kdl/chainfksolverpos_recursive.hpp>
 #include <kdl/chainiksolverpos_nr.hpp>
 #include <kdl/chainiksolverpos_nr_jl.hpp>
 #include <kdl/chainiksolvervel_pinv.hpp>
+#include <kdl/jntarray.hpp>
 #include <kdl_parser/kdl_parser.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/qos.hpp>
@@ -35,10 +31,10 @@
 // #include <serviceinterface.h> // local
 // #include <Poco/Net/ServerSocket.h> // system
 
-namespace ik {
+namespace ik::kdl {
 using std::string;
 
-constexpr float FPS = 0.2;
+constexpr float FPS = 50;
 const char* HOST = "192.168.38.128";
 const int PORT = 8899;
 
@@ -96,14 +92,14 @@ private:
 
 public:
     explicit Ik(const rclcpp::NodeOptions& options):
-        Node("ik", options),
+        Node("ik_kdl", options),
         timer(this->create_wall_timer(
             std::chrono::duration<float>(1 / FPS),
             [this] { this->fast_control(); }
         )),
         tf_buffer(this->get_clock()),
-        tf_listener(this->tf_buffer) {
-        //  {
+        tf_listener(this->tf_buffer) // 别缩到这
+    {
         RCLCPP_INFO(this->get_logger(), "This is Ik");
 
         // [robot init]
@@ -305,22 +301,23 @@ private:
 
         // [show forward kin, is it correct?]
         {
-            // decltype(target_frame) out_frame;
-            // // internal?
-            // KDL::JntArray sol_joints_internal(kdl_chain.getNrOfJoints());
-            // for (int i = 0; i < 6; i++) {
-            //     sol_joints_internal(i) = internal_sol.jointpos[i];
-            // }
-            // this->fk_solver_->JntToCart(sol_joints_internal, out_frame);
-            // for (int i = 0; i < 3; i++) {
-            //     RCLCPP_INFO(this->get_logger(), "out_frame.p[%d]: %f", i, out_frame.p(i));
-            // }
+            decltype(target_frame) out_frame;
+            // internal?
+            KDL::JntArray sol_joints_internal(kdl_chain.getNrOfJoints());
+            for (int i = 0; i < 6; i++) {
+                sol_joints_internal(i) = internal_sol.jointpos[i];
+            }
+            this->fk_solver_->JntToCart(sol_joints_internal, out_frame);
+            for (int i = 0; i < 3; i++) {
+                RCLCPP_INFO(this->get_logger(), "out_frame.p[%d]: %f", i, out_frame.p(i));
+            }
 
-            // double x, y, z, w;
-            // out_frame.M.GetQuaternion(x, y, z, w);
-            // RCLCPP_INFO(this->get_logger(), "out_frame.q: %f %f %f %f", x, y, z, w);
-        } // [send to canbus]
-        ret = this->robot_service.joint();
+            double x, y, z, w;
+            out_frame.M.GetQuaternion(x, y, z, w);
+            RCLCPP_INFO(this->get_logger(), "out_frame.q: %f %f %f %f", x, y, z, w);
+        }
+        // [send to canbus]
+        ret = this->robot_service.robotServiceSetRobotPosData2Canbus(sol_joints.data.data());
 
         {
             for (int i = 0; i < 6; i++) {
@@ -394,11 +391,11 @@ private:
     // }
 };
 
-} // namespace ik
+} // namespace ik::kdl
 
 #include "rclcpp_components/register_node_macro.hpp"
 
 // Register the component with class_loader.
 // This acts as a sort of entry point, allowing the component to be discoverable
 // when its library is being loaded into a running process.
-RCLCPP_COMPONENTS_REGISTER_NODE(ik::Ik)
+RCLCPP_COMPONENTS_REGISTER_NODE(ik::kdl::Ik)
