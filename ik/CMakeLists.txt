@@ -7,7 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 ## By adding -Wall and -Werror, the compiler does not ignore warnings anymore,
 ## enforcing cleaner code.
-add_definitions(-Wall -Werror)
+## add_definitions(-Wall -Werror)
+add_definitions(-Wall)
 
 ## Export compile commands for clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -20,9 +21,21 @@ ament_auto_find_build_dependencies()
 # [build]
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
-  # src/kdl.cpp
+  src/kdl.cpp
   src/moveit.cpp
+  src/test.cpp
 )
+
+add_executable(moveit_server_exe src/moveit_server.cpp)
+ament_target_dependencies(
+  moveit_server_exe
+  "moveit_ros_planning_interface"
+  "moveit_visual_tools"
+  "rclcpp"
+)
+
+install(TARGETS moveit_server_exe
+  DESTINATION lib/${PROJECT_NAME})
 
 # [dep.system.ceres]
 find_package(Ceres REQUIRED)
@@ -65,10 +78,17 @@ rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN ik::kdl::Ik
   EXECUTABLE ik_kdl_exe
 )
+
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN ik::moveit::Ik
   EXECUTABLE ik_moveit_exe
 )
+
+rclcpp_components_register_node(${PROJECT_NAME}
+  PLUGIN ik::test::Ik
+  EXECUTABLE ik_test_exe
+)
+
 
 # [testing]
 

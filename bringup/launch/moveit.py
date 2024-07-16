@@ -27,12 +27,12 @@ def generate_launch_description():
         #     executable='vr_cali_node',
         #     name='vr_cali',
         # ),
-        Node(
-            package='ik',
-            executable='ik_kdl_exe',
-            name='ik_kdl',
-            output='screen',
-            parameters=[{'robot_description': 'aubo/urdf/aubo.urdf'}]
-        ),
-        # ik_moveit_node,
+        # Node(
+        #     package='ik',
+        #     executable='ik_kdl_exe',
+        #     name='ik_kdl',
+        #     output='screen',
+        #     parameters=[{'robot_description': 'aubo/urdf/aubo.urdf'}]
+        # ),
+        ik_moveit_node,
     ])

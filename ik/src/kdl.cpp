@@ -293,7 +293,7 @@ private:
         for (int i = 0; i < 6; i++) {
             RCLCPP_INFO(
                 this->get_logger(),
-                "internal_sol.jointpos[%d]: %f",
+                "sdk sol [%d]: %f",
                 i,
                 internal_sol.jointpos[i] / M_PI * 180.0
             );
@@ -317,16 +317,12 @@ private:
             RCLCPP_INFO(this->get_logger(), "out_frame.q: %f %f %f %f", x, y, z, w);
         }
         // [send to canbus]
-        ret = this->robot_service.robotServiceSetRobotPosData2Canbus(sol_joints.data.data());
+        // ret = this->robot_service.robotServiceSetRobotPosData2Canbus(sol_joints.data.data());
+        ret = this->robot_service.robotServiceSetRobotPosData2Canbus(internal_sol.jointpos);
 
         {
             for (int i = 0; i < 6; i++) {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "sol_joints[%d]: %f",
-                    i,
-                    sol_joints(i) / M_PI * 180.0
-                );
+                RCLCPP_INFO(this->get_logger(), "kdl sol[%d]: %f", i, sol_joints(i) / M_PI * 180.0);
             }
         }
         if (ret != aubo_robot_namespace::InterfaceCallSuccCode) {
