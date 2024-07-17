@@ -1,10 +1,10 @@
 /ik_moveit:
   ros__parameters:
     vm: true
-    fps_moveit_plan: 5.0
-    fps_aubo_query: 5.0
+    fps_moveit_plan: 40.0
+    fps_aubo_query: 40.0
     fps_aubo_consume: 200.0
-    latency_hand_to_before_plan: 0.010
+    latency_hand_to_before_plan: 0.030
     # there is time to wait for queue!!
     latency_after_plan_others: 0.030
     size_expected_mac_points: 60 # should least 50

@@ -24,18 +24,19 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/kdl.cpp
   src/moveit.cpp
   src/test.cpp
+  # src/login_test
 )
 
-add_executable(moveit_server_exe src/moveit_server.cpp)
-ament_target_dependencies(
-  moveit_server_exe
-  "moveit_ros_planning_interface"
-  "moveit_visual_tools"
-  "rclcpp"
-)
-
-install(TARGETS moveit_server_exe
-  DESTINATION lib/${PROJECT_NAME})
+# [single cpp]
+# add_executable(moveit_server_exe src/moveit_server.cpp)
+# ament_target_dependencies(
+#   moveit_server_exe
+#   "moveit_ros_planning_interface"
+#   "moveit_visual_tools"
+#   "rclcpp"
+# )
+# install(TARGETS moveit_server_exe
+#   DESTINATION lib/${PROJECT_NAME})
 
 # [dep.system.ceres]
 find_package(Ceres REQUIRED)
@@ -88,6 +89,11 @@ rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN ik::test::Ik
   EXECUTABLE ik_test_exe
 )
+
+# rclcpp_components_register_node(${PROJECT_NAME}
+#   PLUGIN ik::login_test::LoginTest
+#   EXECUTABLE login_test_exe
+# )
 
 
 # [testing]

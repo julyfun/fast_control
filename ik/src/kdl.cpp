@@ -284,12 +284,20 @@ private:
         const double initial_positions_arr[] = { -3.607505, 0.341427, -2.684385,
                                                  0.115326,  1.106423, 1.570813 };
         aubo_robot_namespace::wayPoint_S internal_sol;
+        const auto start_t = std::chrono::high_resolution_clock::now();
+        auto print_t = [&start_t](std::string name) {
+            const auto end_t = std::chrono::high_resolution_clock::now();
+            const auto duration =
+                std::chrono::duration_cast<std::chrono::microseconds>(end_t - start_t);
+            RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "%s: %ld us", name.c_str(), duration.count());
+        };
         this->robot_service.robotServiceRobotIk(
             initial_positions_arr,
             { out_position.x(), out_position.y(), out_position.z() },
             { orientation.w(), orientation.x(), orientation.y(), orientation.z() },
             internal_sol
         );
+        print_t("robotServiceRobotIk");
         for (int i = 0; i < 6; i++) {
             RCLCPP_INFO(
                 this->get_logger(),
@@ -301,6 +309,7 @@ private:
 
         // [show forward kin, is it correct?]
         {
+            print_t("before kdl");
             decltype(target_frame) out_frame;
             // internal?
             KDL::JntArray sol_joints_internal(kdl_chain.getNrOfJoints());
@@ -311,6 +320,7 @@ private:
             for (int i = 0; i < 3; i++) {
                 RCLCPP_INFO(this->get_logger(), "out_frame.p[%d]: %f", i, out_frame.p(i));
             }
+            print_t("after kdl");
 
             double x, y, z, w;
             out_frame.M.GetQuaternion(x, y, z, w);

@@ -25,6 +25,6 @@ def generate_launch_description():
             executable='ik_kdl_exe',
             name='ik_kdl',
             output='screen',
-            parameters=[{'robot_description': 'aubo/urdf/aubo.urdf'}]
+            parameters=[config]
         ),
     ])

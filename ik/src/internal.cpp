@@ -1,22 +1,13 @@
 #include <atomic>
 #include <cstdint>
+#include <moveit/collision_detection/collision_common.h>
 #include <mutex>
 #include <queue>
 
-#include <moveit/collision_detection/collision_common.h>
-#include <moveit/move_group/capability_names.h>
 #include <moveit/move_group_interface/move_group_interface.h>
-#include <moveit/moveit_cpp/moveit_cpp.h>
-#include <moveit/planning_scene/planning_scene.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
-#include <moveit/planning_scene_monitor/planning_scene_monitor.h>
 #include <moveit/robot_model/joint_model_group.h>
-#include <moveit_msgs/moveit_msgs/msg/planning_scene.hpp>
-#include <moveit_msgs/srv/apply_planning_scene.hpp>
-#include <moveit_msgs/srv/get_planning_scene.hpp>
 #include <moveit_visual_tools/moveit_visual_tools.h>
-#include <rclcpp/executor.hpp>
-#include <rclcpp/future_return_code.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <serviceinterface.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -26,7 +17,7 @@
 #include "AuboRobotMetaType.h"
 #include "ik/filter.hpp"
 
-namespace ik::moveit {
+namespace ik::internal {
 
 using Points = trajectory_msgs::msg::JointTrajectory::_points_type;
 using geometry_msgs::msg::Pose;
@@ -47,19 +38,8 @@ private:
     rclcpp::TimerBase::SharedPtr timer_moveit_plan;
     rclcpp::TimerBase::SharedPtr timer_aubo_query;
     // [moveit]
-    std::shared_ptr<rclcpp::Node> node_for_move_group;
+    std::shared_ptr<rclcpp::Node> node_for_movegroup;
     MoveGroupInterface move_group_interface;
-    // [planning scene]
-    // const ::moveit::core::RobotModelPtr robot_model;
-    const ::moveit::core::JointModelGroup* joint_model_group;
-    // [load]
-    // planning_scene::PlanningScene virtual_planning_scene;
-    // [t.service]
-    std::shared_ptr<rclcpp::Node> node_for_srv;
-    rclcpp::Client<moveit_msgs::srv::GetPlanningScene>::SharedPtr ps_srv;
-    // [t.monitor]
-    std::shared_ptr<rclcpp::Node> node_for_monitor;
-    std::shared_ptr<planning_scene_monitor::PlanningSceneMonitor> psm;
     // [aubo]
     ServiceInterface robot_service;
     double fps_aubo_consume;
@@ -71,10 +51,10 @@ private:
     std::array<double, 6> last_sent_aubo_point;
     uint64_t last_sent_aubo_point_id;
     std::mutex last_sent_aubo_point_mutex;
-    // [plan points]
-    std::deque<std::array<double, 6>> plan_point_queue;
-    uint64_t plan_points_parent_id;
-    std::mutex plan_points_mutex;
+
+    std::deque<std::array<double, 6>> moveit_point_queue;
+    uint64_t moveit_points_parent_id;
+    std::mutex moveit_points_mutex;
     // [hand filter]
     PositionFilter<2, 1> pos_filter;
     double q_x;
@@ -92,67 +72,19 @@ public:
         tf_buffer(this->get_clock()),
         tf_listener(this->tf_buffer),
         // [moveit]
-        node_for_move_group(std::make_shared<rclcpp::Node>("node_for_move_group")),
-        move_group_interface(node_for_move_group, "classic_six"),
-        joint_model_group([&]() {
-            return this->move_group_interface.getRobotModel()->getJointModelGroup("classic_six");
-        }()),
-        // [t.like inter]
-        node_for_srv(std::make_shared<rclcpp::Node>("node_for_srv")),
-        // [psm]
-        node_for_monitor(std::make_shared<rclcpp::Node>("node_for_monitor")),
-        psm(std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(
-            this->node_for_move_group,
-            "robot_description"
-        ))
-    // [t.service]
-    // 太抽象
-    //[load]
-    // virtual_planning_scene([&]() {
-    //     robot_model_loader::RobotModelLoader robot_model_loader(
-    //         this->node_for_move_group,
-    //         "robot_description"
-    //     );
-    //     const ::moveit::core::RobotModelPtr& kinematic_model = robot_model_loader.getModel();
-    //     return planning_scene::PlanningScene(kinematic_model);
-    // }())
+        node_for_movegroup(std::make_shared<rclcpp::Node>("node_for_movegroup")),
+        move_group_interface(node_for_movegroup, "classic_six")
     //
     {
-        // planning_scene([&]() { return planning_scene::PlanningScene(this->robot_model); }()) {
-        // planning_scene_monitor::PlanningSceneMonitor asd(node_for_move_group, "");
-        // planning_scene::PlanningScene(this->move_group_interface.getRobotModel());
         RCLCPP_INFO(this->get_logger(), "Moveit ik started.");
-
-        // [psm]
-        // if (!psm->getPlanningScene()) {
-        //     RCLCPP_ERROR(this->get_logger(), "Failed to get planning scene");
-        //     return;
-        // }
-        this->psm->startSceneMonitor("/monitored_planning_scene");
-        this->psm->startStateMonitor("/joint_states");
-        {
-            bool success = this->psm->requestPlanningSceneState("/get_planning_scene");
-            if (!success) {
-                RCLCPP_ERROR(this->get_logger(), "Failed to get planning scene");
-            } else {
-                RCLCPP_INFO(this->get_logger(), "Got planning scene");
-            }
-        }
-        // psm->startWorldGeometryMonitor();
-        // psm->startStateMonitor();
-        // {
-        //     using namespace std::chrono_literals;
-        //     rclcpp::sleep_for(2s);
-        // }
-
         // [timer]
         {
             // const double fps_moveit_plan = this->get_parameter("fps_moveit_plan").as_double();
-            const double fps_moveit_plan = 40.0;
+            const double fps_moveit_plan = 2.0;
             RCLCPP_INFO(this->get_logger(), "fps_moveit_plan: %f", fps_moveit_plan);
             this->timer_moveit_plan = this->create_wall_timer(
                 std::chrono::duration<double>(1.0 / fps_moveit_plan),
-                [this]() { this->callback_internal_ik(); }
+                [this]() { this->callback_moveit_plan(); }
             );
             const double fps_aubo_query = this->get_parameter("fps_aubo_query").as_double();
             // const double fps_aubo_query = 1.0;
@@ -162,7 +94,7 @@ public:
             );
         }
         // [node for movegroup]
-        std::thread([&]() { rclcpp::spin(node_for_move_group); }).detach();
+        std::thread([&]() { rclcpp::spin(node_for_movegroup); }).detach();
 
         // [constants]
         this->fps_aubo_consume = this->get_parameter("fps_aubo_consume").as_double();
@@ -232,98 +164,8 @@ public:
 
                 return collision_object;
             }();
-
-            // [load]
-
-            // auto moveit_cpp = std::make_shared<moveit_cpp::MoveItCpp>(node_for_move_group);
-            // moveit_cpp->getPlanningSceneMonitor()->providePlanningSceneService();
-            // ::moveit::planning_interface::PlanningSceneInterface planning_scene_interface(moveit_cpp
-            // );
-            // [old]
             ::moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
             planning_scene_interface.applyCollisionObject(collision_object);
-            planning_scene_interface.getObjects();
-            for (const auto& object: planning_scene_interface.getObjects()) {
-                RCLCPP_INFO(this->get_logger(), "Object: %s", object.first.c_str());
-            }
-
-            // [t.monitor]
-            // auto current_state = move_group_interface.getCurrentState();
-            // RCLCPP_INFO(
-            //     this->get_logger(),
-            //     "desk type %s",
-            //     planning_scene_monitor::LockedPlanningSceneRO(this->psm)
-            //         ->getObjectType("desk")
-            //         .db.c_str()
-            // );
-
-            // [t.monitor]
-            // RCLCPP_INFO(this->get_logger(), "<<<");
-            // rclcpp::sleep_for(std::chrono::seconds(1));
-            // this->psm->updateSceneWithCurrentState();
-            // RCLCPP_INFO(
-            //     this->get_logger(),
-            //     "%s",
-            //     psm->getPlanningScene()->getObjectType("desk").db.c_str()
-            // );
-            // RCLCPP_INFO(this->get_logger(), ">>>");
-
-            // [t.local]
-            // ::moveit::PlanningScene planning_scene(this->move_group_interface.getRobotModel());
-
-            // [t.like inter]
-            {
-                RCLCPP_INFO(this->get_logger(), "[t.like inter]");
-                this->ps_srv =
-                    this->node_for_srv->create_client<moveit_msgs::srv::GetPlanningScene>(
-                        move_group::GET_PLANNING_SCENE_SERVICE_NAME
-                    );
-                auto request = std::make_shared<moveit_msgs::srv::GetPlanningScene::Request>();
-                moveit_msgs::srv::GetPlanningScene::Response::SharedPtr response;
-                std::vector<std::string> result;
-                request->components.components = request->components.WORLD_OBJECT_NAMES;
-
-                // auto planning_scene = planning_scene::PlanningScene();
-                auto res = this->ps_srv->async_send_request(request);
-                if (rclcpp::spin_until_future_complete(this->node_for_srv, res)
-                    != rclcpp::FutureReturnCode::SUCCESS)
-                {
-                    RCLCPP_ERROR(this->get_logger(), "[t.like inter] Failed to get planning scene");
-                }
-                response = res.get();
-                for (const moveit_msgs::msg::CollisionObject& collision_object:
-                     response->scene.world.collision_objects)
-                {
-                    result.push_back(collision_object.id);
-                }
-                for (const std::string& object_id: result) {
-                    RCLCPP_INFO(this->get_logger(), "Object: %s", object_id.c_str());
-                }
-            }
-        }
-
-        {
-
-        } // [t.r0]
-        {
-            planning_scene_monitor::LockedPlanningSceneRO planning_scene(psm);
-            const auto& collision_objects = planning_scene->getWorld()->getObjectIds();
-            // print their names
-            RCLCPP_INFO(this->get_logger(), "num: %d", int(collision_objects.size())); // 0
-
-            int box_count = 0;
-            for (const auto& object_id: collision_objects) {
-                // 获取每个碰撞对象
-                auto object = planning_scene->getWorld()->getObject(object_id);
-
-                // 检查对象是否为盒子（box）类型
-                for (const auto& shape: object->shapes_) {
-                    if (shape->type == shapes::ShapeType::BOX || true) {
-                        ++box_count;
-                    }
-                }
-            }
-            RCLCPP_INFO(this->get_logger(), "There are %d boxes in the scene", box_count);
         }
 
         { // kalman init
@@ -343,144 +185,20 @@ public:
     }
 
 private:
-    void callback_internal_ik() {
-        //
-        const auto [pos, ori] = this->get_pose();
-        const double ts_before_plan = this->now().seconds();
-        const auto ts_estimated_hand = ts_before_plan - this->latency_hand_to_before_plan;
-        this->pos_filter.update(
-            { pos.x(), pos.y(), pos.z() },
-            ts_estimated_hand,
-            { this->q_x, this->q_v },
-            { this->r_x }
-        );
-
-        const auto mac_size = this->get_aubo_mac_size();
-        const auto points_size = mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0);
-        const double ts_estimated_effector_arraival = ts_before_plan
-            + double(points_size) / this->fps_aubo_consume + this->latency_after_plan_others;
-        const auto pos_estimated_effector =
-            this->pos_filter.predict_pos(ts_estimated_effector_arraival);
-
-        // print_t("#2");
-
-        struct Out {
-            double base;
-            double min;
-            double max;
-        };
-        const auto out_pos = [](const Eigen::Vector3<double>& position,
-                                const Out& outx,
-                                const Out& outy,
-                                const Out& outz,
-                                const double ratio) {
-            return tf2::Vector3(
-                std::clamp(outx.base + position.x() * ratio, outx.min, outx.max),
-                std::clamp(outy.base + position.y() * ratio, outy.min, outy.max),
-                std::clamp(outz.base + position.z() * ratio, outz.min, outz.max)
-            );
-        };
-
-        const auto out_esti_pos = out_pos(
-            pos_estimated_effector,
-            { 0.4, 0.4, 1.8 },
-            { 0, -1.8, 1.8 },
-            { 0.1, 0.15, 1.8 },
-            1.0
-        );
-
-        const auto [this_plan_parent_id, from] = [&]() {
-            std::lock_guard<std::mutex> lock(this->last_sent_aubo_point_mutex);
-            const auto parent_id = this->last_sent_aubo_point_id;
-            const auto from = this->last_sent_aubo_point;
-            return std::make_tuple(parent_id, from);
-        }();
-        const auto ori_here = ori;
-        const auto to = [&] {
-            geometry_msgs::msg::Pose msg;
-            msg.position.x = out_esti_pos[0];
-            msg.position.y = out_esti_pos[1];
-            msg.position.z = out_esti_pos[2];
-            msg.orientation = tf2::toMsg(ori_here);
-            return msg;
-        }();
-
-        const auto point = this->get_internal_ik(from, to);
-
-        if (point.has_value()) {
-            if (this->collide(point.value())) {
-                return;
-            }
-            std::lock_guard<std::mutex> lock(this->plan_points_mutex);
-            if (this->plan_points_parent_id != this_plan_parent_id) {
-                while (!this->plan_point_queue.empty()) {
-                    this->plan_point_queue.pop_front();
-                }
-            }
-            this->plan_point_queue.push_back(point.value());
-            // this->last_sent_aubo_point = point;
-            // this->moveit_points_queue.push(poin);
-            this->plan_points_parent_id = this->last_sent_aubo_point_id;
-        }
-    }
-
-    bool collide(const std::array<double, 6>& joint_angles) {
-        using namespace collision_detection;
-        CollisionRequest request;
-        CollisionResult result;
-        request.contacts = true;
-        request.max_contacts = 100;
-
-        planning_scene_monitor::LockedPlanningSceneRW planning_scene(psm);
-        // ::moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
-        auto robot_state = planning_scene->getCurrentStateNonConst();
-        robot_state.setJointGroupPositions(this->joint_model_group, joint_angles.data());
-        planning_scene->checkSelfCollision(request, result, robot_state);
-        if (result.collision) {
-            RCLCPP_ERROR(this->get_logger(), "Self Collision!");
-            return true;
-        }
-        planning_scene->checkCollision(request, result, robot_state);
-        if (result.collision) {
-            RCLCPP_ERROR(this->get_logger(), "Out Collision!");
-            return true;
-        }
-
-        // planning_scene_monitor::LockedPlanningSceneRO planning_scene(psm);
-        // const auto& collision_objects = planning_scene->getWorld()->getObjectIds();
-        // // print their names
-        // RCLCPP_INFO(this->get_logger(), "num: %d", int(collision_objects.size())); // 0
-
-        // int box_count = 0;
-        // for (const auto& object_id: collision_objects) {
-        //     // 获取每个碰撞对象
-        //     auto object = planning_scene->getWorld()->getObject(object_id);
-
-        //     // 检查对象是否为盒子（box）类型
-        //     for (const auto& shape: object->shapes_) {
-        //         if (shape->type == shapes::ShapeType::BOX || true) {
-        //             ++box_count;
-        //         }
-        //     }
-        // }
-        // RCLCPP_INFO(this->get_logger(), "There are %d boxes in the scene", box_count);
-        return false;
-    }
-
     void callback_moveit_plan() {
-        // RCLCPP_INFO(this->get_logger(), "callback_moveit_plan");
+        RCLCPP_INFO(this->get_logger(), "callback_moveit_plan");
         // count time
         const auto t_start = std::chrono::high_resolution_clock::now();
         auto print_t = [&t_start](const std::string& name) {
             const auto t_end = std::chrono::high_resolution_clock::now();
             const auto duration =
                 std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start);
-            // RCLCPP_INFO(
-            //     rclcpp::get_logger("rclcpp"),
-            //     "Time taken by %s: %ld mis",
-            //     name.c_str(),
-            //     duration.count()
-            // );
+            RCLCPP_INFO(
+                rclcpp::get_logger("rclcpp"),
+                "Time taken by %s: %ld mis",
+                name.c_str(),
+                duration.count()
+            );
         };
 
         const auto [pos, ori] = this->get_pose();
@@ -493,7 +211,7 @@ private:
             { this->r_x }
         );
 
-        // print_t("#1");
+        print_t("#1");
 
         // get mac size
         const auto mac_size = this->get_aubo_mac_size();
@@ -503,7 +221,7 @@ private:
         const auto pos_estimated_effector =
             this->pos_filter.predict_pos(ts_estimated_effector_arraival);
 
-        // print_t("#2");
+        print_t("#2");
 
         struct Out {
             double base;
@@ -542,7 +260,8 @@ private:
             }
         }
 
-        // print_t("#3");
+        print_t("#3");
+
         const auto [this_plan_parent_id, from] = [&]() {
             std::lock_guard<std::mutex> lock(this->last_sent_aubo_point_mutex);
             const auto parent_id = this->last_sent_aubo_point_id;
@@ -559,40 +278,40 @@ private:
             return msg;
         }();
         // show from
-        // RCLCPP_INFO(
-        //     this->get_logger(),
-        //     "from: %f %f %f %f %f %f",
-        //     from[0],
-        //     from[1],
-        //     from[2],
-        //     from[3],
-        //     from[4],
-        //     from[5]
-        // );
+        RCLCPP_INFO(
+            this->get_logger(),
+            "from: %f %f %f %f %f %f",
+            from[0],
+            from[1],
+            from[2],
+            from[3],
+            from[4],
+            from[5]
+        );
         // show to
-        // RCLCPP_INFO(
-        //     this->get_logger(),
-        //     "to: %f %f %f %f %f %f %f",
-        //     to.position.x,
-        //     to.position.y,
-        //     to.position.z,
-        //     to.orientation.w,
-        //     to.orientation.x,
-        //     to.orientation.y,
-        //     to.orientation.z
-        // );
+        RCLCPP_INFO(
+            this->get_logger(),
+            "to: %f %f %f %f %f %f %f",
+            to.position.x,
+            to.position.y,
+            to.position.z,
+            to.orientation.w,
+            to.orientation.x,
+            to.orientation.y,
+            to.orientation.z
+        );
 
-        // print_t("#4");
+        print_t("#4");
 
         const auto trajectory = this->get_moveit_trajectory(from, to);
 
-        // print_t("#5");
+        print_t("#5");
 
         if (trajectory.has_value()) {
-            std::lock_guard<std::mutex> lock(this->plan_points_mutex);
-            if (this->plan_points_parent_id != this_plan_parent_id) {
-                while (!this->plan_point_queue.empty()) {
-                    this->plan_point_queue.pop_front();
+            std::lock_guard<std::mutex> lock(this->moveit_points_mutex);
+            if (this->moveit_points_parent_id != this_plan_parent_id) {
+                while (!this->moveit_point_queue.empty()) {
+                    this->moveit_point_queue.pop_front();
                 }
             }
             const auto& points = trajectory.value();
@@ -613,21 +332,21 @@ private:
                 //     point[4],
                 //     point[5]
                 // );
-                this->plan_point_queue.push_back(point);
+                this->moveit_point_queue.push_back(point);
             }
-            // for (size_t i = 0; i < 6; ++i) {
-            //     this->last_sent_aubo_point[i] = points.back().positions[i];
-            // } // whole wrong!
+            for (size_t i = 0; i < 6; ++i) {
+                this->last_sent_aubo_point[i] = points.back().positions[i];
+            }
             // this->moveit_points_queue.push(poin);
-            this->plan_points_parent_id = this->last_sent_aubo_point_id;
+            this->moveit_points_parent_id = this->last_sent_aubo_point_id;
             RCLCPP_INFO(this->get_logger(), "plan %d points", int(points.size()));
         }
 
-        // print_t("#6");
+        print_t("#6");
     }
 
     void callback_aubo_query() {
-        // RCLCPP_INFO(this->get_logger(), "########### callback_aubo_query");
+        RCLCPP_INFO(this->get_logger(), "########### callback_aubo_query");
         const auto mac_size = this->get_aubo_mac_size();
         const auto points_size = mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0);
         auto arr_to_waypoint = [](const std::array<double, 6>& arr) {
@@ -641,10 +360,10 @@ private:
             return arr;
         };
         const auto waypoint_vector = [&]() {
-            std::lock_guard<std::mutex> lock_plan(this->plan_points_mutex);
-            if (this->plan_points_parent_id != this->last_sent_aubo_point_id) {
-                while (!this->plan_point_queue.empty()) {
-                    this->plan_point_queue.pop_front();
+            std::lock_guard<std::mutex> lock_plan(this->moveit_points_mutex);
+            if (this->moveit_points_parent_id != this->last_sent_aubo_point_id) {
+                while (!this->moveit_point_queue.empty()) {
+                    this->moveit_point_queue.pop_front();
                 } // 必须防止饥饿，就算数据没用都要送过去一堆老的
             }
             // [todo] check if "lock_guard not at the beginning of the block" is ok.
@@ -653,14 +372,13 @@ private:
             std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
             auto pre_point = this->last_sent_aubo_point;
             int points_needed = this->size_expected_mac_points - points_size;
-            // RCLCPP_INFO(this->get_logger(), "points_needed: %d", points_needed);
             while (points_needed > 0) {
-                if (this->plan_point_queue.empty()) {
+                if (this->moveit_point_queue.empty()) {
                     waypoint_vector.push_back(arr_to_waypoint(pre_point));
                     points_needed--;
                     continue;
                 }
-                const auto nxt_point = this->plan_point_queue.front();
+                const auto nxt_point = this->moveit_point_queue.front();
                 const int interpolation_num = [&]() {
                     int itpltn = 1;
                     for (size_t i = 0; i < 6; ++i) {
@@ -671,7 +389,6 @@ private:
                     }
                     return itpltn;
                 }();
-                RCLCPP_INFO(this->get_logger(), "interpolation_num: %d", interpolation_num);
                 for (int i = 0; i < interpolation_num && points_needed > 0; i++) {
                     std::array<double, 6> point;
                     for (size_t j = 0; j < 6; ++j) {
@@ -682,19 +399,19 @@ private:
                     waypoint_vector.push_back(arr_to_waypoint(point));
                     if (i == interpolation_num - 1) {
                         pre_point = nxt_point;
-                        this->plan_point_queue.pop_front();
+                        this->moveit_point_queue.pop_front();
                     }
                     points_needed--;
                 }
             }
             return waypoint_vector;
         }();
-        // RCLCPP_INFO(
-        //     this->get_logger(),
-        //     "in %d send %d",
-        //     int(points_size),
-        //     int(waypoint_vector.size())
-        // );
+        RCLCPP_INFO(
+            this->get_logger(),
+            "points_size: %d, points_to_send: %d",
+            int(points_size),
+            int(waypoint_vector.size())
+        );
         if (waypoint_vector.empty()) {
             return;
         }
@@ -708,7 +425,7 @@ private:
                 this->get_logger(),
                 "sent %d points, %d points in plan queue",
                 int(waypoint_vector.size()),
-                int(this->plan_point_queue.size())
+                int(this->moveit_point_queue.size())
             );
         }
     }
@@ -718,7 +435,7 @@ private:
         using namespace std::chrono;
 
         if (this->vm) {
-            return uint16_t(this->size_expected_mac_points - 5) * 6;
+            return uint16_t(0);
         }
 
         auto start = high_resolution_clock::now();
@@ -761,24 +478,21 @@ private:
         return std::make_tuple(transform.getOrigin(), transform.getRotation());
     }
 
-    std::optional<std::array<double, 6>>
-    get_internal_ik(const std::array<double, 6>& init, const Pose& to) {
-        const double initial_positions_arr[] = { init[0], init[1], init[2],
-                                                 init[3], init[4], init[5] };
-        aubo_robot_namespace::wayPoint_S internal_sol;
-        int ret = this->robot_service.robotServiceRobotIk(
-            initial_positions_arr,
-            { to.position.x, to.position.y, to.position.z },
-            { to.orientation.w, to.orientation.x, to.orientation.y, to.orientation.z },
-            internal_sol
+    bool collide(const std::array<double, 6>& point) {
+        using namespace collision_detection;
+        auto current_state = this->move_group_interface.getCurrentState();
+        ::moveit::core::RobotState assume_state(*current_state); // copy the state
+        std::vector<double> joint_group_positions;
+        assume_state.setJointGroupPositions(
+            current_state->getJointModelGroup("classic_six"),
+            joint_group_positions
         );
-        if (ret != aubo_robot_namespace::InterfaceCallSuccCode) {
-            RCLCPP_ERROR(this->get_logger(), "ik failed");
-            return std::nullopt;
-        }
-        return std::array<double, 6> { internal_sol.jointpos[0], internal_sol.jointpos[1],
-                                       internal_sol.jointpos[2], internal_sol.jointpos[3],
-                                       internal_sol.jointpos[4], internal_sol.jointpos[5] };
+        CollisionRequest collision_request;
+        CollisionResult collision_result;
+        // collision_request.contacts = true;
+        // collision_request.max_contacts = 1000;
+
+        return false;
     }
 
     // suppose urdf is loaded and links are specified
@@ -801,7 +515,7 @@ private:
             ::moveit::core::RobotStatePtr current_state =
                 this->move_group_interface.getCurrentState();
 
-            // print_t("##1");
+            print_t("##1");
 
             ::moveit::core::RobotState start_state(*current_state);
             std::vector<double> joint_group_positions;
@@ -809,7 +523,7 @@ private:
                 current_state->getJointModelGroup("classic_six"),
                 joint_group_positions
             );
-            // print_t("##2");
+            print_t("##2");
             for (size_t i = 0; i < 6; ++i) {
                 joint_group_positions[i] = from[i];
             }
@@ -817,19 +531,19 @@ private:
                 current_state->getJointModelGroup("classic_six"),
                 joint_group_positions
             );
-            // print_t("##3");
+            print_t("##3");
             this->move_group_interface.setStartState(start_state);
-            // print_t("##4");
+            print_t("##4");
         }
         // [Set a target Pose]
         this->move_group_interface.setPoseTarget(to);
-        // print_t("##5");
+        print_t("##5");
         auto const [success, plan] = [this] {
             ::moveit::planning_interface::MoveGroupInterface::Plan msg;
             auto const ok = static_cast<bool>(this->move_group_interface.plan(msg));
             return std::make_pair(ok, msg);
         }();
-        // print_t("##6");
+        print_t("##6");
         if (success) {
             return plan.trajectory_.joint_trajectory.points;
         } else {
@@ -841,11 +555,11 @@ private:
 
 //
 
-} // namespace ik::moveit
+} // namespace ik::internal
 
 #include "rclcpp_components/register_node_macro.hpp"
 
 // Register the component with class_loader.
 // This acts as a sort of entry point, allowing the component to be discoverable
 // when its library is being loaded into a running process.
-RCLCPP_COMPONENTS_REGISTER_NODE(ik::moveit::Ik)
+RCLCPP_COMPONENTS_REGISTER_NODE(ik::internal::Ik)
