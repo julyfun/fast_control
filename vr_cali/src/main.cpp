@@ -64,7 +64,8 @@ public:
         tf_buffer(this->get_clock()),
         tf_listener(this->tf_buffer),
         tf_ref_custom(this),
-        tf_random_upright(this) {
+        tf_random_upright(this) //
+    {
         RCLCPP_INFO(this->get_logger(), "Node has been started.");
 
         this->p0_sub = this->create_subscription<std_msgs::msg::Empty>(

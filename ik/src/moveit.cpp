@@ -34,9 +34,49 @@ using ik::PositionFilter;
 using ik::PositionPredictorInterface;
 using ::moveit::planning_interface::MoveGroupInterface;
 
-const double JOINTS_ANGLE_MAX_VEL[6] = {
-    2.596177, 2.596177, 2.596177, 3.110177, 3.110177, 3.110177
-};
+// const double JOINTS_ANGLE_MAX_VEL[6] = {
+//     2.596177, 2.596177, 2.596177, 3.110177, 3.110177, 3.110177
+// };
+// / 15 / pi * 180
+const double JOINTS_ANGLE_MAX_VEL[6] = { 20.0, 20.0, 20.0, 22.0, 22.0, 22.0 };
+
+double reduced_angle(const double angle) {
+    // between -pi and pi
+    return angle - 2 * M_PI * std::floor((angle + M_PI) / (2 * M_PI));
+}
+
+double angle_interpolation(const double left, const double right, const int itpltn, const int n) {
+    // left maybe 179, right maybe -179, there differenct is 2
+    const double diff = reduced_angle(right - left);
+    return left + diff * itpltn / n;
+}
+
+double closest_angle(const double from, const double target) {
+    return target + reduced_angle(from - target);
+}
+
+const double ANGLE_LIMIT[6][2] = { { -360, 360 }, { -175, 175 }, { -175, 175 },
+                                   { -175, 175 }, { -175, 175 }, { -360, 360 } };
+
+const double deg2rad(const double deg) {
+    return deg / 180.0 * M_PI;
+}
+
+const double rad2deg(const double rad) {
+    return rad / M_PI * 180.0;
+}
+
+std::array<double, 6> limited_closest_joint_angles(
+    const std::array<double, 6>& joint_angles,
+    const std::array<double, 6>& target_angles
+) {
+    std::array<double, 6> result;
+    for (size_t i = 0; i < 6; ++i) {
+        result[i] = closest_angle(joint_angles[i], target_angles[i]);
+        result[i] = std::clamp(result[i], deg2rad(ANGLE_LIMIT[i][0]), deg2rad(ANGLE_LIMIT[i][1]));
+    }
+    return result;
+}
 
 class Ik: public rclcpp::Node {
 private:
@@ -175,7 +215,7 @@ public:
 
         // [robot init]
         {
-            const char* host = "192.168.38.128";
+            const char* host = "192.168.132.100";
             const int port = 8899;
             const int ret = this->robot_service.robotServiceLogin(host, port, "aubo", "123456");
             if (ret == aubo_robot_namespace::InterfaceCallSuccCode) {
@@ -186,6 +226,7 @@ public:
             }
             this->robot_service.robotServiceEnterTcp2CanbusMode();
             this->robot_service.robotServiceInitGlobalMoveProfile();
+            this->robot_service.robotServiceSetRobotCollisionClass(9);
         }
         // [aubo state]
         {
@@ -193,9 +234,13 @@ public:
             aubo_robot_namespace::JointStatus joint_status[6];
             const int ret = this->robot_service.robotServiceGetRobotJointStatus(joint_status, 6);
             if (ret == aubo_robot_namespace::InterfaceCallSuccCode) {
+                std::string init_joints;
                 for (size_t i = 0; i < 6; ++i) {
                     this->last_sent_aubo_point[i] = joint_status[i].jointPosJ; // ok this
+                    init_joints +=
+                        std::to_string(this->last_sent_aubo_point[i] / M_PI * 180.0) + " ";
                 }
+                RCLCPP_INFO(this->get_logger(), "init joints %s", init_joints.c_str());
             } else {
                 RCLCPP_ERROR(this->get_logger(), "get joint status failed");
                 return;
@@ -364,29 +409,45 @@ private:
 
         // print_t("#2");
 
-        struct Out {
+        struct V1Out {
             double base;
             double min;
             double max;
         };
-        const auto out_pos = [](const Eigen::Vector3<double>& position,
-                                const Out& outx,
-                                const Out& outy,
-                                const Out& outz,
-                                const double ratio) {
+        const auto v1_out_pos = [](const Eigen::Vector3<double>& position,
+                                   const V1Out& outx,
+                                   const V1Out& outy,
+                                   const V1Out& outz,
+                                   const double ratio) {
             return tf2::Vector3(
                 std::clamp(outx.base + position.x() * ratio, outx.min, outx.max),
                 std::clamp(outy.base + position.y() * ratio, outy.min, outy.max),
                 std::clamp(outz.base + position.z() * ratio, outz.min, outz.max)
             );
         };
+        struct Out {
+            double base;
+            double min;
+            double max;
+            double ratio;
+        };
+        const auto out_pos = [](const Eigen::Vector3<double>& position,
+                                const Out& outx,
+                                const Out& outy,
+                                const Out& outz) {
+            return tf2::Vector3(
+                std::clamp(outx.base + position.x() * outx.ratio, outx.min, outx.max),
+                std::clamp(outy.base + position.y() * outy.ratio, outy.min, outy.max),
+                std::clamp(outz.base + position.z() * outz.ratio, outz.min, outz.max)
+            );
+        };
 
+        const double ratio = 1.0;
         const auto out_esti_pos = out_pos(
             pos_estimated_effector,
-            { 0.4, 0.4, 1.8 },
-            { 0, -1.8, 1.8 },
-            { 0.1, 0.15, 1.8 },
-            1.0
+            { +0.4, -0.7, 0.7, ratio },
+            { 0, -1.8, 1.8, ratio },
+            { 0.2, 0.15, 1.0, ratio }
         );
 
         const auto [this_plan_parent_id, from] = [&]() {
@@ -445,185 +506,7 @@ private:
             RCLCPP_ERROR(this->get_logger(), "Out Collision!");
             return true;
         }
-
-        // planning_scene_monitor::LockedPlanningSceneRO planning_scene(psm);
-        // const auto& collision_objects = planning_scene->getWorld()->getObjectIds();
-        // // print their names
-        // RCLCPP_INFO(this->get_logger(), "num: %d", int(collision_objects.size())); // 0
-
-        // int box_count = 0;
-        // for (const auto& object_id: collision_objects) {
-        //     // 获取每个碰撞对象
-        //     auto object = planning_scene->getWorld()->getObject(object_id);
-
-        //     // 检查对象是否为盒子（box）类型
-        //     for (const auto& shape: object->shapes_) {
-        //         if (shape->type == shapes::ShapeType::BOX || true) {
-        //             ++box_count;
-        //         }
-        //     }
-        // }
-        // RCLCPP_INFO(this->get_logger(), "There are %d boxes in the scene", box_count);
         return false;
-    }
-
-    void callback_moveit_plan() {
-        // RCLCPP_INFO(this->get_logger(), "callback_moveit_plan");
-        // count time
-        const auto t_start = std::chrono::high_resolution_clock::now();
-        auto print_t = [&t_start](const std::string& name) {
-            const auto t_end = std::chrono::high_resolution_clock::now();
-            const auto duration =
-                std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start);
-            // RCLCPP_INFO(
-            //     rclcpp::get_logger("rclcpp"),
-            //     "Time taken by %s: %ld mis",
-            //     name.c_str(),
-            //     duration.count()
-            // );
-        };
-
-        const auto [pos, ori] = this->get_pose();
-        const double ts_before_plan = this->now().seconds();
-        const auto ts_estimated_hand = ts_before_plan - this->latency_hand_to_before_plan;
-        this->pos_filter.update(
-            { pos.x(), pos.y(), pos.z() },
-            ts_estimated_hand,
-            { this->q_x, this->q_v },
-            { this->r_x }
-        );
-
-        // print_t("#1");
-
-        // get mac size
-        const auto mac_size = this->get_aubo_mac_size();
-        const auto points_size = mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0);
-        const double ts_estimated_effector_arraival = ts_before_plan
-            + double(points_size) / this->fps_aubo_consume + this->latency_after_plan_others;
-        const auto pos_estimated_effector =
-            this->pos_filter.predict_pos(ts_estimated_effector_arraival);
-
-        // print_t("#2");
-
-        struct Out {
-            double base;
-            double min;
-            double max;
-        };
-        const auto out_pos = [](const Eigen::Vector3<double>& position,
-                                const Out& outx,
-                                const Out& outy,
-                                const Out& outz,
-                                const double ratio) {
-            return tf2::Vector3(
-                std::clamp(outx.base + position.x() * ratio, outx.min, outx.max),
-                std::clamp(outy.base + position.y() * ratio, outy.min, outy.max),
-                std::clamp(outz.base + position.z() * ratio, outz.min, outz.max)
-            );
-        };
-
-        const auto out_esti_pos = out_pos(
-            pos_estimated_effector,
-            { 0.4, 0.4, 1.8 },
-            { 0, -1.8, 1.8 },
-            { 0.1, 0.05, 1.8 },
-            1.0
-        );
-
-        {
-            for (size_t i = 0; i < 3; ++i) {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "pos[%d]: %f -> %f",
-                    int(i),
-                    pos[i],
-                    pos_estimated_effector[i]
-                );
-            }
-        }
-
-        // print_t("#3");
-        const auto [this_plan_parent_id, from] = [&]() {
-            std::lock_guard<std::mutex> lock(this->last_sent_aubo_point_mutex);
-            const auto parent_id = this->last_sent_aubo_point_id;
-            const auto from = this->last_sent_aubo_point;
-            return std::make_tuple(parent_id, from);
-        }();
-        const auto ori_here = ori;
-        const auto to = [&] {
-            geometry_msgs::msg::Pose msg;
-            msg.position.x = out_esti_pos[0];
-            msg.position.y = out_esti_pos[1];
-            msg.position.z = out_esti_pos[2];
-            msg.orientation = tf2::toMsg(ori_here);
-            return msg;
-        }();
-        // show from
-        // RCLCPP_INFO(
-        //     this->get_logger(),
-        //     "from: %f %f %f %f %f %f",
-        //     from[0],
-        //     from[1],
-        //     from[2],
-        //     from[3],
-        //     from[4],
-        //     from[5]
-        // );
-        // show to
-        // RCLCPP_INFO(
-        //     this->get_logger(),
-        //     "to: %f %f %f %f %f %f %f",
-        //     to.position.x,
-        //     to.position.y,
-        //     to.position.z,
-        //     to.orientation.w,
-        //     to.orientation.x,
-        //     to.orientation.y,
-        //     to.orientation.z
-        // );
-
-        // print_t("#4");
-
-        const auto trajectory = this->get_moveit_trajectory(from, to);
-
-        // print_t("#5");
-
-        if (trajectory.has_value()) {
-            std::lock_guard<std::mutex> lock(this->plan_points_mutex);
-            if (this->plan_points_parent_id != this_plan_parent_id) {
-                while (!this->plan_point_queue.empty()) {
-                    this->plan_point_queue.pop_front();
-                }
-            }
-            const auto& points = trajectory.value();
-            for (size_t i = 0; i < points.size(); ++i) {
-                const std::array<double, 6> point {
-                    points[i].positions[0], points[i].positions[1], points[i].positions[2],
-                    points[i].positions[3], points[i].positions[4], points[i].positions[5]
-                };
-                // print angles
-                // RCLCPP_INFO(
-                //     this->get_logger(),
-                //     "Point %zu: %f %f %f %f %f %f",
-                //     i,
-                //     point[0],
-                //     point[1],
-                //     point[2],
-                //     point[3],
-                //     point[4],
-                //     point[5]
-                // );
-                this->plan_point_queue.push_back(point);
-            }
-            // for (size_t i = 0; i < 6; ++i) {
-            //     this->last_sent_aubo_point[i] = points.back().positions[i];
-            // } // whole wrong!
-            // this->moveit_points_queue.push(poin);
-            this->plan_points_parent_id = this->last_sent_aubo_point_id;
-            RCLCPP_INFO(this->get_logger(), "plan %d points", int(points.size()));
-        }
-
-        // print_t("#6");
     }
 
     void callback_aubo_query() {
@@ -647,8 +530,7 @@ private:
                     this->plan_point_queue.pop_front();
                 } // 必须防止饥饿，就算数据没用都要送过去一堆老的
             }
-            // [todo] check if "lock_guard not at the beginning of the block" is ok.
-            // 必须保证 moveit_points_queue 始终有效
+            // ? 必须保证 moveit_points_queue 始终有效
             std::vector<aubo_robot_namespace::wayPoint_S> waypoint_vector;
             std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
             auto pre_point = this->last_sent_aubo_point;
@@ -660,14 +542,17 @@ private:
                     points_needed--;
                     continue;
                 }
-                const auto nxt_point = this->plan_point_queue.front();
+                // make it close to pre_point
+                const auto nxt_point =
+                    limited_closest_joint_angles(this->plan_point_queue.front(), pre_point);
                 const int interpolation_num = [&]() {
                     int itpltn = 1;
                     for (size_t i = 0; i < 6; ++i) {
                         // 假设电机就会这样执行
-                        const double vel =
-                            std::abs(nxt_point[i] - pre_point[i]) / (1.0 / this->fps_aubo_consume);
-                        itpltn = std::max(itpltn, int(ceil(vel / JOINTS_ANGLE_MAX_VEL[i])));
+                        const double vel = std::abs(reduced_angle(nxt_point[i] - pre_point[i]))
+                            / (1.0 / this->fps_aubo_consume);
+                        itpltn =
+                            std::max(itpltn, int(ceil(vel / deg2rad(JOINTS_ANGLE_MAX_VEL[i]))));
                     }
                     return itpltn;
                 }();
@@ -676,8 +561,22 @@ private:
                     std::array<double, 6> point;
                     for (size_t j = 0; j < 6; ++j) {
                         // don't push pre_joint
-                        point[j] = pre_point[j]
-                            + (nxt_point[j] - pre_point[j]) * (i + 1) / interpolation_num;
+                        // point[j] = pre_point[j]
+                        //     + (nxt_point[j] - pre_point[j]) * (i + 1) / interpolation_num;
+                        point[j] = angle_interpolation(
+                            pre_point[j],
+                            nxt_point[j],
+                            i + 1,
+                            interpolation_num
+                        );
+                        // if (j == 0)
+                        //     RCLCPP_INFO(
+                        //         this->get_logger(),
+                        //         "joint %d: %f -> %f",
+                        //         int(j),
+                        //         pre_point[j],
+                        //         point[j]
+                        //     );
                     }
                     waypoint_vector.push_back(arr_to_waypoint(point));
                     if (i == interpolation_num - 1) {
@@ -710,6 +609,17 @@ private:
                 int(waypoint_vector.size()),
                 int(this->plan_point_queue.size())
             );
+            // this time sent joint[0] are:
+            // for (auto i: waypoint_vector) {
+            //     RCLCPP_INFO(this->get_logger(), "joint[0]: %f", i.jointpos[0] / M_PI * 180.0);
+            // }
+            for (auto i: waypoint_vector) {
+                std::string joints;
+                for (size_t j = 0; j < 6; ++j) {
+                    joints += std::to_string(i.jointpos[j] / M_PI * 180.0) + " ";
+                }
+                RCLCPP_INFO(this->get_logger(), "joints: %s", joints.c_str());
+            }
         }
     }
 
@@ -735,6 +645,11 @@ private:
             this->get_logger(),
             "Time taken by function: %ld microseconds",
             duration.count()
+        );
+        RCLCPP_INFO(
+            this->get_logger(),
+            "macTargetPosDataSize: %d",
+            robot_diagnosis_info.macTargetPosDataSize
         );
         return robot_diagnosis_info.macTargetPosDataSize;
     }

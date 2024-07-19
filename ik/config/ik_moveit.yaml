@@ -1,6 +1,6 @@
 /ik_moveit:
   ros__parameters:
-    vm: true
+    vm: false
     fps_moveit_plan: 40.0
     fps_aubo_query: 40.0
     fps_aubo_consume: 200.0
