@@ -24,6 +24,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/kdl.cpp
   src/moveit.cpp
   src/test.cpp
+  src/joint_broadcaster.cpp
   # src/login_test
 )
 
@@ -43,8 +44,12 @@ find_package(Ceres REQUIRED)
 target_include_directories(${PROJECT_NAME} PUBLIC ${CERES_INCLUDE_DIRS})
 target_link_libraries(${PROJECT_NAME} ${CERES_LIBRARIES})
 
-# [dep.system.Poco]
+# [dep.system.jsoncpp]
+find_package(jsoncpp REQUIRED)
+target_include_directories(${PROJECT_NAME} PUBLIC ${jsoncpp_INCLUDE_DIRS})
+target_link_libraries(${PROJECT_NAME} jsoncpp)
 
+# [dep.system.Poco]
 # find_package(Poco REQUIRED COMPONENTS Foundation Net Util)
 # message(STATUS "Poco_FOUND: ${Poco_FOUND}")
 # target_include_directories(${PROJECT_NAME} PUBLIC ${Poco_INCLUDE_DIRS})
@@ -88,6 +93,11 @@ rclcpp_components_register_node(${PROJECT_NAME}
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN ik::test::Ik
   EXECUTABLE ik_test_exe
+)
+
+rclcpp_components_register_node(${PROJECT_NAME}
+  PLUGIN ik::joint_broadcaster::JointBroadcaster
+  EXECUTABLE ik_joint_broadcaster_exe
 )
 
 # rclcpp_components_register_node(${PROJECT_NAME}

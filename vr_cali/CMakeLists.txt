@@ -23,6 +23,12 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/main.cpp
 )
 
+
+# [dep.system.yaml-cpp]
+find_package(yaml-cpp REQUIRED)
+target_include_directories(${PROJECT_NAME} PUBLIC ${YAML_CPP_INCLUDE_DIRS})
+target_link_libraries(${PROJECT_NAME} yaml-cpp)
+
 # [dep.system.Poco]
 
 # find_package(Poco REQUIRED COMPONENTS Foundation Net Util)

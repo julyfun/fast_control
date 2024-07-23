@@ -2,9 +2,11 @@
 
 // C++ system
 #include <cstdint>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -12,6 +14,7 @@
 #include <rclcpp/logging.hpp>
 #include <rclcpp/qos.hpp>
 #include <rclcpp/utilities.hpp>
+#include <std_msgs/msg/detail/empty__struct.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -23,6 +26,7 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
+#include <yaml-cpp/yaml.h>
 // #include <serviceinterface.h> // local
 // #include <Poco/Net/ServerSocket.h> // system
 
@@ -38,17 +42,37 @@ void vec_info(const tf2::Vector3& vec) {
     RCLCPP_INFO(rclcpp::get_logger("vr_cali"), "x: %f, y: %f, z: %f", vec.x(), vec.y(), vec.z());
 }
 
+inline bool ignore(std::fstream& fin, const std::string& str) {
+    static std::string str_cache;
+    char char_cache = 0;
+    while (!fin.eof()) {
+        fin.get(char_cache);
+        if (char_cache == str[str_cache.size()]) {
+            str_cache.append({ char_cache });
+            // std::cout << "match: " << char_cache << " " << str[str_cache.size()] <<
+            // " " << str_cache.size() << std::endl;
+        } else {
+            str_cache.clear();
+            // std::cout << "!match: " << char_cache << " " << str[str_cache.size()]
+            // << " " << str_cache.size() << std::endl;
+        }
+        // std::cout << str_cache << std::endl;
+        if (str_cache.size() == str.size())
+            return true;
+    }
+    return false;
+}
+
 class VrCali: public rclcpp::Node {
 private:
     tf2_ros::Buffer tf_buffer;
     tf2_ros::TransformListener tf_listener;
-    tf2_ros::StaticTransformBroadcaster
-        tf_ref_custom; // custom representation => ref representation
-    tf2_ros::StaticTransformBroadcaster tf_random_upright;
+    tf2_ros::StaticTransformBroadcaster tf_br; // custom representation => ref representation
 
     std::optional<tf2::Vector3> p0;
     std::optional<tf2::Vector3> px;
     std::optional<tf2::Vector3> py;
+    // std::optional<tf2::Quaternion> upright_quaternion;
     // need a quaternion
 
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr p0_sub;
@@ -56,15 +80,15 @@ private:
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr py_sub;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr cali_fixed_sub;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr tracker_upright_sub;
-    // tf buffer
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr save_sub;
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr load_sub;
 
 public:
     explicit VrCali(const rclcpp::NodeOptions& options):
         Node("vr_cali", options),
         tf_buffer(this->get_clock()),
         tf_listener(this->tf_buffer),
-        tf_ref_custom(this),
-        tf_random_upright(this) //
+        tf_br(this) //
     {
         RCLCPP_INFO(this->get_logger(), "Node has been started.");
 
@@ -93,7 +117,17 @@ public:
             10,
             [this](std_msgs::msg::Empty::SharedPtr msg) { this->tracker_upright(msg); }
         );
-    };
+        this->save_sub = this->create_subscription<std_msgs::msg::Empty>(
+            "/cali/save",
+            10,
+            [this](std_msgs::msg::Empty::SharedPtr msg) { this->save_yaml(msg); }
+        );
+        this->load_sub = this->create_subscription<std_msgs::msg::Empty>(
+            "/cali/load",
+            10,
+            [this](std_msgs::msg::Empty::SharedPtr msg) { this->load_yaml(msg); }
+        );
+    }
 
     ~VrCali() override = default;
 
@@ -103,14 +137,122 @@ private:
         auto rotation_matrix = this->get_rotation("tracker_random", "custom");
         const auto translation_vector = tf2::Vector3(0.0, 0, 0);
         const auto transform = tf2::Transform(rotation_matrix, translation_vector);
-        tf2::Quaternion quaternion = transform.getRotation();
+        auto upright_quaternion = transform.getRotation();
         geometry_msgs::msg::TransformStamped transform_stamped;
         transform_stamped.header.stamp = this->now();
         transform_stamped.header.frame_id = "tracker_random"; // target
         transform_stamped.child_frame_id = "tracker_upright"; // source
         transform_stamped.transform.translation = tf2::toMsg(transform.getOrigin());
-        transform_stamped.transform.rotation = tf2::toMsg(quaternion);
-        this->tf_random_upright.sendTransform(transform_stamped); // 可能重新标定, so not static
+        transform_stamped.transform.rotation = tf2::toMsg(upright_quaternion);
+        this->tf_br.sendTransform(transform_stamped); // 可能重新标定, so not static
+    }
+
+    void save_os(const std_msgs::msg::Empty::SharedPtr msg) {
+        RCLCPP_INFO(this->get_logger(), "Try to save.");
+        geometry_msgs::msg::TransformStamped transform_stamped;
+        try {
+            const auto file_name = [&]() {
+                const char* home = std::getenv("HOME");
+                return std::string(home) + "/.teleop/cali.csv";
+            }();
+            std::ofstream file(file_name, std::ios::out);
+            const auto out_trans = [&](const std::string& target_frame,
+                                       const std::string& source_frame) {
+                transform_stamped =
+                    this->tf_buffer.lookupTransform(target_frame, source_frame, tf2::TimePointZero);
+                file << "translation: " << transform_stamped.transform.translation.x << " "
+                     << transform_stamped.transform.translation.y << " "
+                     << transform_stamped.transform.translation.z << "\n";
+                file << "rotation: " << transform_stamped.transform.rotation.x << " "
+                     << transform_stamped.transform.rotation.y << " "
+                     << transform_stamped.transform.rotation.z << " "
+                     << transform_stamped.transform.rotation.w << "\n";
+            };
+            out_trans("ref", "custom");
+            out_trans("tracker_random", "tracker_upright");
+            file.close();
+        } catch (tf2::TransformException& ex) {
+            RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
+        }
+    }
+
+    void save_yaml(const std_msgs::msg::Empty::SharedPtr msg) {
+        RCLCPP_INFO(this->get_logger(), "Try to save.");
+        try {
+            using std::string;
+            const auto file_name = [&]() {
+                const char* home = std::getenv("HOME");
+                return std::string(home) + "/.teleop/cali.yaml";
+            }();
+            YAML::Emitter out;
+            out << YAML::BeginMap;
+            const auto out_trans = [&](const string& target_frame, const string& source_frame) {
+                geometry_msgs::msg::TransformStamped transform_stamped =
+                    this->tf_buffer.lookupTransform(target_frame, source_frame, tf2::TimePointZero);
+                out << YAML::Key << target_frame + "-" + source_frame;
+                out << YAML::Value << YAML::BeginMap;
+                out << YAML::Key << "translation";
+                out << YAML::Value << YAML::BeginSeq;
+                out << transform_stamped.transform.translation.x;
+                out << transform_stamped.transform.translation.y;
+                out << transform_stamped.transform.translation.z;
+                out << YAML::EndSeq;
+                out << YAML::Key << "rotation";
+                out << YAML::Value << YAML::BeginSeq;
+                out << transform_stamped.transform.rotation.x;
+                out << transform_stamped.transform.rotation.y;
+                out << transform_stamped.transform.rotation.z;
+                out << transform_stamped.transform.rotation.w;
+                out << YAML::EndSeq;
+                out << YAML::EndMap;
+            };
+            out_trans("ref", "custom");
+            out_trans("tracker_random", "tracker_upright");
+            std::ofstream file(file_name, std::ios::out);
+            file << out.c_str();
+            file.close();
+        } catch (tf2::TransformException& ex) {
+            RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
+        }
+    }
+
+    void load_yaml(const std_msgs::msg::Empty::SharedPtr msg) {
+        RCLCPP_INFO(this->get_logger(), "Try to load.");
+        try {
+            using std::string;
+            const auto file_name = [&]() {
+                const char* home = std::getenv("HOME");
+                return std::string(home) + "/.teleop/cali.yaml";
+            }();
+            YAML::Node config = YAML::LoadFile(file_name);
+            auto in_trans = [&](const string& target_frame, const string& source_frame) {
+                const auto translation = config[target_frame + "-" + source_frame]["translation"];
+                const auto rotation = config[target_frame + "-" + source_frame]["rotation"];
+                tf2::Transform transform;
+                transform.setOrigin(tf2::Vector3(
+                    translation[0].as<double>(),
+                    translation[1].as<double>(),
+                    translation[2].as<double>()
+                ));
+                transform.setRotation(tf2::Quaternion(
+                    rotation[0].as<double>(),
+                    rotation[1].as<double>(),
+                    rotation[2].as<double>(),
+                    rotation[3].as<double>()
+                ));
+                geometry_msgs::msg::TransformStamped transform_stamped;
+                transform_stamped.header.stamp = this->now();
+                transform_stamped.header.frame_id = target_frame;
+                transform_stamped.child_frame_id = source_frame;
+                transform_stamped.transform.translation = tf2::toMsg(transform.getOrigin());
+                transform_stamped.transform.rotation = tf2::toMsg(transform.getRotation());
+                this->tf_br.sendTransform(transform_stamped);
+            };
+            in_trans("ref", "custom");
+            in_trans("tracker_random", "tracker_upright");
+        } catch (tf2::TransformException& ex) {
+            RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
+        }
     }
 
     tf2::Matrix3x3 get_rotation(const std::string& target_frame, const std::string& source_frame) {
@@ -198,7 +340,7 @@ private:
         transform_stamped.child_frame_id = "custom"; // source
         transform_stamped.transform.translation = tf2::toMsg(transform.getOrigin());
         transform_stamped.transform.rotation = tf2::toMsg(quaternion);
-        this->tf_ref_custom.sendTransform(transform_stamped); // 可能重新标定, so not static
+        this->tf_br.sendTransform(transform_stamped); // 可能重新标定, so not static
 
         vec_info(axis_under(p0.value(), px.value(), transform.inverse()));
         vec_info(axis_under(p0.value(), py.value(), transform.inverse()));

@@ -19,6 +19,8 @@
 #include <rclcpp/future_return_code.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <serviceinterface.h>
+#include <std_msgs/msg/int16.hpp>
+#include <sys/types.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <trajectory_msgs/msg/detail/joint_trajectory__struct.hpp>
 #include <trajectory_msgs/msg/detail/joint_trajectory_point__struct.hpp>
@@ -38,7 +40,19 @@ using ::moveit::planning_interface::MoveGroupInterface;
 //     2.596177, 2.596177, 2.596177, 3.110177, 3.110177, 3.110177
 // };
 // / 15 / pi * 180
-const double JOINTS_ANGLE_MAX_VEL[6] = { 20.0, 20.0, 20.0, 22.0, 22.0, 22.0 };
+// const double JOINTS_ANGLE_MAX_VEL[6] = { 20.0, 20.0, 20.0, 22.0, 22.0, 22.0 };
+// mul 2
+const double JOINTS_ANGLE_MAX_VEL[6] = { 40.0, 40.0, 40.0, 44.0, 44.0, 44.0 };
+// div 4
+// const double JOINTS_ANGLE_MAX_VEL[6] = { 5.0, 5.0, 5.0, 5.5, 5.5, 5.5 };
+const double POS_MIN_DIFF_TO_SEND = 0.005;
+const double ANGLE_MIN_DIFF_TO_SEND = 1.0;
+
+double qua_theta(const tf2::Quaternion& q1, const tf2::Quaternion& q2) {
+    // ref: https://math.stackexchange.com/questions/90081/quaternion-distance
+    const double dot = q1.dot(q2);
+    return std::acos(2 * dot * dot - 1);
+}
 
 double reduced_angle(const double angle) {
     // between -pi and pi
@@ -86,6 +100,7 @@ private:
     // [timer]
     rclcpp::TimerBase::SharedPtr timer_moveit_plan;
     rclcpp::TimerBase::SharedPtr timer_aubo_query;
+    // rclcpp::TimerBase::SharedPtr timer_mac_size_update;
     // [moveit]
     std::shared_ptr<rclcpp::Node> node_for_move_group;
     MoveGroupInterface move_group_interface;
@@ -104,6 +119,10 @@ private:
     ServiceInterface robot_service;
     double fps_aubo_consume;
     int size_expected_mac_points;
+    // [aubo.libtopic]
+    rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr mac_size_sub;
+    uint16_t sub_mac_size = 0; // most recent macsize. Must initialize
+    std::mutex sub_mac_size_mutex;
     // [latency]
     double latency_hand_to_before_plan;
     double latency_after_plan_others;
@@ -114,12 +133,18 @@ private:
     // [plan points]
     std::deque<std::array<double, 6>> plan_point_queue;
     uint64_t plan_points_parent_id;
+    geometry_msgs::msg::Pose last_planned_pose;
     std::mutex plan_points_mutex;
+    // [macsize estimate]
+    uint16_t last_estimated_point_size;
+    double last_estimated_point_size_time;
     // [hand filter]
     PositionFilter<2, 1> pos_filter;
     double q_x;
     double q_v;
     double r_x;
+    // [hungry]
+    bool fill_to_avoid_hunger;
     // [vm]
     bool vm;
 
@@ -144,6 +169,15 @@ public:
         psm(std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(
             this->node_for_move_group,
             "robot_description"
+        )),
+        // [aubo.libtopic]
+        mac_size_sub(this->create_subscription<std_msgs::msg::Int16>(
+            "/mac_target_pos_data_size",
+            10,
+            [this](const std_msgs::msg::Int16::SharedPtr msg) {
+                std::lock_guard<std::mutex> lock(this->sub_mac_size_mutex);
+                this->sub_mac_size = msg->data;
+            }
         ))
     // [t.service]
     // 太抽象
@@ -187,8 +221,7 @@ public:
 
         // [timer]
         {
-            // const double fps_moveit_plan = this->get_parameter("fps_moveit_plan").as_double();
-            const double fps_moveit_plan = 40.0;
+            const double fps_moveit_plan = this->get_parameter("fps_moveit_plan").as_double();
             RCLCPP_INFO(this->get_logger(), "fps_moveit_plan: %f", fps_moveit_plan);
             this->timer_moveit_plan = this->create_wall_timer(
                 std::chrono::duration<double>(1.0 / fps_moveit_plan),
@@ -212,10 +245,11 @@ public:
             this->get_parameter("latency_after_plan_others").as_double();
         this->size_expected_mac_points = this->get_parameter("size_expected_mac_points").as_int();
         this->vm = this->get_parameter("vm").as_bool();
+        this->fill_to_avoid_hunger = this->get_parameter("fill_to_avoid_hunger").as_bool();
 
         // [robot init]
         {
-            const char* host = "192.168.132.100";
+            const char* host = "192.168.1.7";
             const int port = 8899;
             const int ret = this->robot_service.robotServiceLogin(host, port, "aubo", "123456");
             if (ret == aubo_robot_namespace::InterfaceCallSuccCode) {
@@ -385,6 +419,12 @@ public:
             this->q_v = this->get_parameter("pos_filter_q_v").as_double();
             this->r_x = this->get_parameter("pos_filter_r_x").as_double();
         }
+
+        {
+            // estimate
+            this->last_estimated_point_size = 0;
+            this->last_estimated_point_size_time = this->now().seconds();
+        }
     }
 
 private:
@@ -400,7 +440,7 @@ private:
             { this->r_x }
         );
 
-        const auto mac_size = this->get_aubo_mac_size();
+        const auto mac_size = this->get_aubo_mac_size_by_another_tcp();
         const auto points_size = mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0);
         const double ts_estimated_effector_arraival = ts_before_plan
             + double(points_size) / this->fps_aubo_consume + this->latency_after_plan_others;
@@ -447,7 +487,7 @@ private:
             pos_estimated_effector,
             { +0.4, -0.7, 0.7, ratio },
             { 0, -1.8, 1.8, ratio },
-            { 0.2, 0.15, 1.0, ratio }
+            { 0.35, 0.15, 1.0, ratio }
         );
 
         const auto [this_plan_parent_id, from] = [&]() {
@@ -473,6 +513,37 @@ private:
                 return;
             }
             std::lock_guard<std::mutex> lock(this->plan_points_mutex);
+            // check trans and angular dis
+            const double hyp = std::hypot(
+                to.position.x - this->last_planned_pose.position.x,
+                to.position.y - this->last_planned_pose.position.y,
+                to.position.z - this->last_planned_pose.position.z
+            );
+            const double the = qua_theta(
+                tf2::Quaternion(
+                    to.orientation.x,
+                    to.orientation.y,
+                    to.orientation.z,
+                    to.orientation.w
+                ),
+                tf2::Quaternion(
+                    this->last_planned_pose.orientation.x,
+                    this->last_planned_pose.orientation.y,
+                    this->last_planned_pose.orientation.z,
+                    this->last_planned_pose.orientation.w
+                )
+            );
+            // if (hyp < POS_MIN_DIFF_TO_SEND && the < deg2rad(ANGLE_MIN_DIFF_TO_SEND)) {
+            //     RCLCPP_INFO(
+            //         this->get_logger(),
+            //         "diff too small, cancel plan. pos is %f, angle is %f",
+            //         hyp,
+            //         the
+            //     );
+            //     return;
+            // }
+
+            this->last_planned_pose = to;
             if (this->plan_points_parent_id != this_plan_parent_id) {
                 while (!this->plan_point_queue.empty()) {
                     this->plan_point_queue.pop_front();
@@ -511,8 +582,39 @@ private:
 
     void callback_aubo_query() {
         // RCLCPP_INFO(this->get_logger(), "########### callback_aubo_query");
-        const auto mac_size = this->get_aubo_mac_size();
-        const auto points_size = mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0);
+        const auto mac_size = this->get_aubo_mac_size_by_another_tcp();
+        {
+            // [last sent]
+            const auto time_interval = this->now().seconds() - this->last_estimated_point_size_time;
+            const int consumed = std::floor(time_interval * this->fps_aubo_consume);
+            this->last_estimated_point_size =
+                uint16_t(std::max(0, int(this->last_estimated_point_size) - consumed));
+            this->last_estimated_point_size_time += double(consumed) / this->fps_aubo_consume;
+            // RCLCPP_INFO(
+            //     this->get_logger(),
+            //     "time_interval: %f, consumed: %d, last_estimated_point_size: %d",
+            //     time_interval,
+            //     consumed,
+            //     int(this->last_estimated_point_size)
+            // );
+        }
+        const auto points_size = std::max(
+            int(this->last_estimated_point_size),
+            mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0)
+        );
+        // const auto points_size = mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0);
+
+        {
+            // print this->last_estimated_point_size,
+            // mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0)
+            //
+            RCLCPP_INFO(
+                this->get_logger(),
+                "est: %d, mac / 6: %d",
+                int(this->last_estimated_point_size),
+                mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0)
+            );
+        }
         auto arr_to_waypoint = [](const std::array<double, 6>& arr) {
             aubo_robot_namespace::wayPoint_S waypoint;
             std::memcpy(waypoint.jointpos, arr.data(), 6 * sizeof(double));
@@ -534,8 +636,23 @@ private:
             std::vector<aubo_robot_namespace::wayPoint_S> waypoint_vector;
             std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
             auto pre_point = this->last_sent_aubo_point;
+
+            // [v1: always fill]
             int points_needed = this->size_expected_mac_points - points_size;
+            RCLCPP_INFO(this->get_logger(), "points_needed: %d", points_needed);
+
+            // [v2]
+            // int points_needed = [&]() {
+            //     if (this->fill_to_avoid_hunger) {
+            //         return this->size_expected_mac_points - points_size;
+            //     }
+            //     if (this->plan_point_queue.empty()) {
+            //         return 0;
+            //     }
+            //     return std::min(this->size_expected_mac_points - points_size, 7);
+            // }();
             // RCLCPP_INFO(this->get_logger(), "points_needed: %d", points_needed);
+
             while (points_needed > 0) {
                 if (this->plan_point_queue.empty()) {
                     waypoint_vector.push_back(arr_to_waypoint(pre_point));
@@ -595,11 +712,13 @@ private:
         //     int(waypoint_vector.size())
         // );
         if (waypoint_vector.empty()) {
+            RCLCPP_INFO(this->get_logger(), "no points to send");
             return;
         }
         {
             std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
             this->robot_service.robotServiceSetRobotPosData2Canbus(waypoint_vector);
+            this->last_estimated_point_size += uint16_t(waypoint_vector.size());
             this->last_sent_aubo_point = waypoint_to_arr(waypoint_vector.back());
             this->last_sent_aubo_point_id++;
             // show size
@@ -616,14 +735,22 @@ private:
             for (auto i: waypoint_vector) {
                 std::string joints;
                 for (size_t j = 0; j < 6; ++j) {
-                    joints += std::to_string(i.jointpos[j] / M_PI * 180.0) + " ";
+                    joints += std::to_string(i.jointpos[j] / M_PI * 180.0).substr(0, 7) + " ";
                 }
                 RCLCPP_INFO(this->get_logger(), "joints: %s", joints.c_str());
             }
         }
     }
 
-    uint16_t get_aubo_mac_size() {
+    uint16_t get_aubo_mac_size_by_another_tcp() {
+        if (this->vm) {
+            return uint16_t(this->size_expected_mac_points - 5) * 6;
+        }
+        std::lock_guard<std::mutex> lock(this->sub_mac_size_mutex);
+        return this->sub_mac_size;
+    }
+
+    uint16_t get_aubo_mac_size_by_diagnosis() {
         // count time here
         using namespace std::chrono;
 
