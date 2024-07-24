@@ -40,13 +40,40 @@ using ::moveit::planning_interface::MoveGroupInterface;
 //     2.596177, 2.596177, 2.596177, 3.110177, 3.110177, 3.110177
 // };
 // / 15 / pi * 180
-// const double JOINTS_ANGLE_MAX_VEL[6] = { 20.0, 20.0, 20.0, 22.0, 22.0, 22.0 };
+// const double JOINTS_ANGLE_MAX_VEL[6] = { 400.0, 400.0, 400.0, 800.0, 800.0, 800.0 };
+// const double JOINTS_ANGLE_MAX_VEL[6] = { 100.0, 100.0, 100.0, 200.0, 200.0, 200.0 };
+// const double JOINTS_ANGLE_MAX_ACC[6] = {
+//     17.30878, 17.30878, 17.30878, 20.73676, 20.73676, 20.73676
+// };
+// div 3.14 * 180
+// const double JOINTS_ANGLE_MAX_ACC[6] = { 5.5, 5.5, 5.5, 6.6, 6.6, 6.6 };
+// * 180
+// const double JOINTS_ANGLE_MAX_ACC_DEG[6] = { 400.0, 400.0, 400.0, 420.0, 420.0, 422.0 };
+
 // mul 2
-const double JOINTS_ANGLE_MAX_VEL[6] = { 40.0, 40.0, 40.0, 44.0, 44.0, 44.0 };
+// const double JOINTS_ANGLE_MAX_VEL[6] = { 40.0, 40.0, 40.0, 44.0, 44.0, 44.0 };
 // div 4
 // const double JOINTS_ANGLE_MAX_VEL[6] = { 5.0, 5.0, 5.0, 5.5, 5.5, 5.5 };
 const double POS_MIN_DIFF_TO_SEND = 0.005;
 const double ANGLE_MIN_DIFF_TO_SEND = 1.0;
+
+template<typename T, size_t N>
+std::array<T, N> minus(const std::array<T, N>& a, const std::array<T, N>& b) {
+    std::array<T, N> result;
+    for (size_t i = 0; i < N; ++i) {
+        result[i] = a[i] - b[i];
+    }
+    return result;
+}
+
+template<typename T, size_t N>
+std::array<T, N> mul(const std::array<T, N>& a, const T b) {
+    std::array<T, N> result;
+    for (size_t i = 0; i < N; ++i) {
+        result[i] = a[i] * b;
+    }
+    return result;
+}
 
 double qua_theta(const tf2::Quaternion& q1, const tf2::Quaternion& q2) {
     // ref: https://math.stackexchange.com/questions/90081/quaternion-distance
@@ -81,12 +108,12 @@ const double rad2deg(const double rad) {
 }
 
 std::array<double, 6> limited_closest_joint_angles(
-    const std::array<double, 6>& joint_angles,
+    const std::array<double, 6>& joint_angles_thats_reduced,
     const std::array<double, 6>& target_angles
 ) {
     std::array<double, 6> result;
     for (size_t i = 0; i < 6; ++i) {
-        result[i] = closest_angle(joint_angles[i], target_angles[i]);
+        result[i] = closest_angle(joint_angles_thats_reduced[i], target_angles[i]);
         result[i] = std::clamp(result[i], deg2rad(ANGLE_LIMIT[i][0]), deg2rad(ANGLE_LIMIT[i][1]));
     }
     return result;
@@ -128,6 +155,7 @@ private:
     double latency_after_plan_others;
     // [plan state]
     std::array<double, 6> last_sent_aubo_point;
+    std::array<double, 6> last_sent_aubo_point_vel;
     uint64_t last_sent_aubo_point_id;
     std::mutex last_sent_aubo_point_mutex;
     // [plan points]
@@ -136,10 +164,11 @@ private:
     geometry_msgs::msg::Pose last_planned_pose;
     std::mutex plan_points_mutex;
     // [macsize estimate]
+    std::mutex last_estimated_point_size_mutex;
     uint16_t last_estimated_point_size;
     double last_estimated_point_size_time;
     // [hand filter]
-    PositionFilter<2, 1> pos_filter;
+    PositionFilter<2, 1> hand_pos_filter;
     double q_x;
     double q_v;
     double r_x;
@@ -147,6 +176,9 @@ private:
     bool fill_to_avoid_hunger;
     // [vm]
     bool vm;
+    // [joints max vel and max acc]
+    std::array<double, 6> joints_deg_max_vel;
+    std::array<double, 6> joints_deg_max_acc;
 
 public:
     explicit Ik(const rclcpp::NodeOptions& options):
@@ -197,6 +229,37 @@ public:
         // planning_scene::PlanningScene(this->move_group_interface.getRobotModel());
         RCLCPP_INFO(this->get_logger(), "Moveit ik started.");
 
+        // [constants]
+        this->fps_aubo_consume = this->get_parameter("fps_aubo_consume").as_double();
+        this->latency_hand_to_before_plan =
+            this->get_parameter("latency_hand_to_before_plan").as_double();
+        this->latency_after_plan_others =
+            this->get_parameter("latency_after_plan_others").as_double();
+        this->size_expected_mac_points = this->get_parameter("size_expected_mac_points").as_int();
+        this->vm = this->get_parameter("vm").as_bool();
+        this->fill_to_avoid_hunger = this->get_parameter("fill_to_avoid_hunger").as_bool();
+        this->joints_deg_max_vel = [&]() {
+            const auto param = this->get_parameter("joints_deg_max_vel").as_double_array();
+            return std::array<double, 6> { param[0], param[1], param[2],
+                                           param[3], param[4], param[5] };
+        }();
+        this->joints_deg_max_acc = [&]() {
+            const auto param = this->get_parameter("joints_deg_max_acc").as_double_array();
+            return std::array<double, 6> { param[0], param[1], param[2],
+                                           param[3], param[4], param[5] };
+        }();
+
+        // [check topic]
+        {
+            if (!this->vm) {
+                int has_message = this->count_publishers("/mac_target_pos_data_size");
+                if (has_message == 0) {
+                    RCLCPP_ERROR(this->get_logger(), "No publisher for /mac_target_pos_data_size");
+                    return;
+                }
+            }
+        }
+
         // [psm]
         // if (!psm->getPlanningScene()) {
         //     RCLCPP_ERROR(this->get_logger(), "Failed to get planning scene");
@@ -237,18 +300,9 @@ public:
         // [node for movegroup]
         std::thread([&]() { rclcpp::spin(node_for_move_group); }).detach();
 
-        // [constants]
-        this->fps_aubo_consume = this->get_parameter("fps_aubo_consume").as_double();
-        this->latency_hand_to_before_plan =
-            this->get_parameter("latency_hand_to_before_plan").as_double();
-        this->latency_after_plan_others =
-            this->get_parameter("latency_after_plan_others").as_double();
-        this->size_expected_mac_points = this->get_parameter("size_expected_mac_points").as_int();
-        this->vm = this->get_parameter("vm").as_bool();
-        this->fill_to_avoid_hunger = this->get_parameter("fill_to_avoid_hunger").as_bool();
-
         // [robot init]
         {
+            // const char* host = "192.168.1.7";
             const char* host = "192.168.1.7";
             const int port = 8899;
             const int ret = this->robot_service.robotServiceLogin(host, port, "aubo", "123456");
@@ -260,7 +314,7 @@ public:
             }
             this->robot_service.robotServiceEnterTcp2CanbusMode();
             this->robot_service.robotServiceInitGlobalMoveProfile();
-            this->robot_service.robotServiceSetRobotCollisionClass(9);
+            this->robot_service.robotServiceSetRobotCollisionClass(8);
         }
         // [aubo state]
         {
@@ -271,6 +325,7 @@ public:
                 std::string init_joints;
                 for (size_t i = 0; i < 6; ++i) {
                     this->last_sent_aubo_point[i] = joint_status[i].jointPosJ; // ok this
+                    this->last_sent_aubo_point_vel[i] = 0.0;
                     init_joints +=
                         std::to_string(this->last_sent_aubo_point[i] / M_PI * 180.0) + " ";
                 }
@@ -430,41 +485,22 @@ public:
 private:
     void callback_internal_ik() {
         //
-        const auto [pos, ori] = this->get_pose();
+        const auto [pos, ori] = this->get_hand_pose();
         const double ts_before_plan = this->now().seconds();
         const auto ts_estimated_hand = ts_before_plan - this->latency_hand_to_before_plan;
-        this->pos_filter.update(
+        this->hand_pos_filter.update(
             { pos.x(), pos.y(), pos.z() },
             ts_estimated_hand,
             { this->q_x, this->q_v },
             { this->r_x }
         );
 
-        const auto mac_size = this->get_aubo_mac_size_by_another_tcp();
-        const auto points_size = mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0);
+        const auto points_size = this->get_esti_limited_point_size();
         const double ts_estimated_effector_arraival = ts_before_plan
             + double(points_size) / this->fps_aubo_consume + this->latency_after_plan_others;
         const auto pos_estimated_effector =
-            this->pos_filter.predict_pos(ts_estimated_effector_arraival);
+            this->hand_pos_filter.predict_pos(ts_estimated_effector_arraival);
 
-        // print_t("#2");
-
-        struct V1Out {
-            double base;
-            double min;
-            double max;
-        };
-        const auto v1_out_pos = [](const Eigen::Vector3<double>& position,
-                                   const V1Out& outx,
-                                   const V1Out& outy,
-                                   const V1Out& outz,
-                                   const double ratio) {
-            return tf2::Vector3(
-                std::clamp(outx.base + position.x() * ratio, outx.min, outx.max),
-                std::clamp(outy.base + position.y() * ratio, outy.min, outy.max),
-                std::clamp(outz.base + position.z() * ratio, outz.min, outz.max)
-            );
-        };
         struct Out {
             double base;
             double min;
@@ -487,7 +523,7 @@ private:
             pos_estimated_effector,
             { +0.4, -0.7, 0.7, ratio },
             { 0, -1.8, 1.8, ratio },
-            { 0.35, 0.15, 1.0, ratio }
+            { 0.2, 0.15, 1.0, ratio }
         );
 
         const auto [this_plan_parent_id, from] = [&]() {
@@ -533,15 +569,20 @@ private:
                     this->last_planned_pose.orientation.w
                 )
             );
-            // if (hyp < POS_MIN_DIFF_TO_SEND && the < deg2rad(ANGLE_MIN_DIFF_TO_SEND)) {
-            //     RCLCPP_INFO(
-            //         this->get_logger(),
-            //         "diff too small, cancel plan. pos is %f, angle is %f",
-            //         hyp,
-            //         the
-            //     );
-            //     return;
-            // }
+            if (hyp < POS_MIN_DIFF_TO_SEND && the < deg2rad(ANGLE_MIN_DIFF_TO_SEND)) {
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "diff too small, cancel plan. pos is %f, angle is %f",
+                    hyp,
+                    the
+                );
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "plan.size(): %d",
+                    int(this->plan_point_queue.size())
+                );
+                return;
+            }
 
             this->last_planned_pose = to;
             if (this->plan_points_parent_id != this_plan_parent_id) {
@@ -581,40 +622,7 @@ private:
     }
 
     void callback_aubo_query() {
-        // RCLCPP_INFO(this->get_logger(), "########### callback_aubo_query");
-        const auto mac_size = this->get_aubo_mac_size_by_another_tcp();
-        {
-            // [last sent]
-            const auto time_interval = this->now().seconds() - this->last_estimated_point_size_time;
-            const int consumed = std::floor(time_interval * this->fps_aubo_consume);
-            this->last_estimated_point_size =
-                uint16_t(std::max(0, int(this->last_estimated_point_size) - consumed));
-            this->last_estimated_point_size_time += double(consumed) / this->fps_aubo_consume;
-            // RCLCPP_INFO(
-            //     this->get_logger(),
-            //     "time_interval: %f, consumed: %d, last_estimated_point_size: %d",
-            //     time_interval,
-            //     consumed,
-            //     int(this->last_estimated_point_size)
-            // );
-        }
-        const auto points_size = std::max(
-            int(this->last_estimated_point_size),
-            mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0)
-        );
-        // const auto points_size = mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0);
-
-        {
-            // print this->last_estimated_point_size,
-            // mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0)
-            //
-            RCLCPP_INFO(
-                this->get_logger(),
-                "est: %d, mac / 6: %d",
-                int(this->last_estimated_point_size),
-                mac_size / 6 + (mac_size % 6 > 0 ? 1 : 0)
-            );
-        }
+        const auto points_size = this->get_esti_limited_point_size();
         auto arr_to_waypoint = [](const std::array<double, 6>& arr) {
             aubo_robot_namespace::wayPoint_S waypoint;
             std::memcpy(waypoint.jointpos, arr.data(), 6 * sizeof(double));
@@ -625,17 +633,17 @@ private:
             std::memcpy(arr.data(), waypoint.jointpos, 6 * sizeof(double));
             return arr;
         };
-        const auto waypoint_vector = [&]() {
+        const auto [waypoint_vector, pre_sent_point, pre_sent_vel] = [&]() {
             std::lock_guard<std::mutex> lock_plan(this->plan_points_mutex);
-            if (this->plan_points_parent_id != this->last_sent_aubo_point_id) {
-                while (!this->plan_point_queue.empty()) {
-                    this->plan_point_queue.pop_front();
-                } // 必须防止饥饿，就算数据没用都要送过去一堆老的
-            }
-            // ? 必须保证 moveit_points_queue 始终有效
+            // if (this->plan_points_parent_id != this->last_sent_aubo_point_id) {
+            //     while (!this->plan_point_queue.empty()) {
+            //         this->plan_point_queue.pop_front();
+            //     } // 必须防止饥饿，就算数据没用都要送过去一堆老的
+            // }
             std::vector<aubo_robot_namespace::wayPoint_S> waypoint_vector;
             std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
-            auto pre_point = this->last_sent_aubo_point;
+            auto pre_sent_point = this->last_sent_aubo_point;
+            auto pre_sent_vel = this->last_sent_aubo_point_vel;
 
             // [v1: always fill]
             int points_needed = this->size_expected_mac_points - points_size;
@@ -653,73 +661,177 @@ private:
             // }();
             // RCLCPP_INFO(this->get_logger(), "points_needed: %d", points_needed);
 
+            // [Try to consume a plan]
             while (points_needed > 0) {
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "In query, plan size: %d",
+                    int(this->plan_point_queue.size())
+                );
                 if (this->plan_point_queue.empty()) {
-                    waypoint_vector.push_back(arr_to_waypoint(pre_point));
+                    waypoint_vector.push_back(arr_to_waypoint(pre_sent_point));
                     points_needed--;
                     continue;
                 }
                 // make it close to pre_point
-                const auto nxt_point =
-                    limited_closest_joint_angles(this->plan_point_queue.front(), pre_point);
-                const int interpolation_num = [&]() {
-                    int itpltn = 1;
-                    for (size_t i = 0; i < 6; ++i) {
-                        // 假设电机就会这样执行
-                        const double vel = std::abs(reduced_angle(nxt_point[i] - pre_point[i]))
-                            / (1.0 / this->fps_aubo_consume);
-                        itpltn =
-                            std::max(itpltn, int(ceil(vel / deg2rad(JOINTS_ANGLE_MAX_VEL[i]))));
+                const auto nxt_plan_point =
+                    limited_closest_joint_angles(this->plan_point_queue.front(), pre_sent_point);
+                // const auto nxt_plan_vel =
+                //     mul(minus(nxt_plan_point, pre_plan_point), this->fps_aubo_consume);
+                std::array<bool, 6> done;
+                int need_done = 6;
+                std::fill(done.begin(), done.end(), false);
+
+                // [generate a sent point]
+                while (points_needed > 0 && need_done > 0) {
+                    const std::array<double, 6> joints_acc = [&]() {
+                        std::array<double, 6> joints_acc = {};
+                        auto sign = [](const double some) { return some > 0 ? 1 : -1; };
+                        auto limited_by = [](const double some, const double abs_lim) {
+                            return std::clamp(some, -abs_lim, abs_lim);
+                        };
+                        for (int i = 0; i < 6; i++) {
+                            const double dis = nxt_plan_point[i] - pre_sent_point[i];
+                            const double a_max = deg2rad(this->joints_deg_max_acc[i]);
+                            const double v_max = deg2rad(this->joints_deg_max_vel[i]);
+                            const double best_v_at_pre_d =
+                                limited_by(sign(dis) * std::sqrt(std::abs(dis) * a_max), v_max);
+                            const double acc_if_goto_best_v =
+                                (best_v_at_pre_d - pre_sent_vel[i]) * this->fps_aubo_consume;
+                            const double limited_acc = limited_by(acc_if_goto_best_v, a_max);
+                            joints_acc[i] = limited_acc;
+                        }
+                        return joints_acc;
+                    }();
+                    const std::array<double, 6> so_v_is = [&]() {
+                        std::array<double, 6> so_v_is = {};
+                        for (int i = 0; i < 6; i++) {
+                            so_v_is[i] = pre_sent_vel[i] + joints_acc[i] / this->fps_aubo_consume;
+                        }
+                        return so_v_is;
+                    }();
+                    pre_sent_vel = so_v_is;
+                    const std::array<double, 6> so_point_is = [&]() {
+                        std::array<double, 6> so_point_is = {};
+                        for (int i = 0; i < 6; i++) {
+                            so_point_is[i] =
+                                pre_sent_point[i] + so_v_is[i] / this->fps_aubo_consume;
+                        }
+                        return so_point_is;
+                    }();
+                    pre_sent_point = so_point_is;
+                    // [print them]
+                    {
+                        std::string a;
+                        for (int i = 0; i < 6; i++) {
+                            a += std::to_string(joints_acc[i] / M_PI * 180.0).substr(0, 6) + " ";
+                        }
+                        RCLCPP_INFO(this->get_logger(), "joints_acc: %s", a.c_str());
+                        std::string v;
+                        for (int i = 0; i < 6; i++) {
+                            v += std::to_string(so_v_is[i] / M_PI * 180.0).substr(0, 6) + " ";
+                        }
+                        RCLCPP_INFO(this->get_logger(), "so_v_is: %s", v.c_str());
+                        std::string x;
+                        for (int i = 0; i < 6; i++) {
+                            x += std::to_string(so_point_is[i] / M_PI * 180.0).substr(0, 6) + " ";
+                        }
+                        RCLCPP_INFO(this->get_logger(), "so_point_is: %s", x.c_str());
                     }
-                    return itpltn;
-                }();
-                RCLCPP_INFO(this->get_logger(), "interpolation_num: %d", interpolation_num);
-                for (int i = 0; i < interpolation_num && points_needed > 0; i++) {
-                    std::array<double, 6> point;
-                    for (size_t j = 0; j < 6; ++j) {
-                        // don't push pre_joint
-                        // point[j] = pre_point[j]
-                        //     + (nxt_point[j] - pre_point[j]) * (i + 1) / interpolation_num;
-                        point[j] = angle_interpolation(
-                            pre_point[j],
-                            nxt_point[j],
-                            i + 1,
-                            interpolation_num
-                        );
-                        // if (j == 0)
-                        //     RCLCPP_INFO(
-                        //         this->get_logger(),
-                        //         "joint %d: %f -> %f",
-                        //         int(j),
-                        //         pre_point[j],
-                        //         point[j]
-                        //     );
-                    }
-                    waypoint_vector.push_back(arr_to_waypoint(point));
-                    if (i == interpolation_num - 1) {
-                        pre_point = nxt_point;
-                        this->plan_point_queue.pop_front();
-                    }
+                    waypoint_vector.push_back(arr_to_waypoint(so_point_is));
                     points_needed--;
+                    for (int i = 0; i < 6; i++) {
+                        // check signbit
+                        if (std::signbit(nxt_plan_point[i] - so_point_is[i])
+                                != std::signbit(nxt_plan_point[i] - pre_sent_point[i])
+                            && !done[i])
+                        {
+                            done[i] = true;
+                            RCLCPP_INFO(
+                                this->get_logger(),
+                                "%d is done, n %f p %f s %f",
+                                i,
+                                nxt_plan_point[i],
+                                pre_sent_point[i],
+                                so_point_is[i]
+                            );
+                            need_done--;
+                        }
+                    }
                 }
+                if (need_done == 0) {
+                    RCLCPP_INFO(this->get_logger(), "need_done == 0, pop");
+                    this->plan_point_queue.pop_front();
+                }
+
+                // const int interpolation_num = [&]() {
+                //     int itpltn = 1;
+                //     for (size_t i = 0; i < 6; ++i) {\
+                //         // 假设电机就会这样执行
+                //         const double vel = nxt_plan_vel[i];
+                //         const double vel_rate = std::abs(vel) / deg2rad(this->joint_deg_max_vel[i]);
+                //         itpltn = std::max(itpltn, int(ceil(vel_rate)));
+                //         // [todo] 加速度不是线性插值吧
+                //         const double acc = (vel - pre_plan_vel[i]) * this->fps_aubo_consume;
+                //         const double acc_rate =
+                //             std::abs(acc) / deg2rad(JOINTS_ANGLE_MAX_ACC_DEG[i]);
+                //         // itpltn = std::max(itpltn, int(ceil(acc_rate)));
+                //         RCLCPP_INFO(
+                //             this->get_logger(),
+                //             "pp %f np %f pv %f nv %f",
+                //             pre_plan_point[i],
+                //             nxt_plan_point[i],
+                //             pre_plan_vel[i],
+                //             nxt_plan_vel[i]
+                //         );
+                //         // output rate
+                //         RCLCPP_INFO(
+                //             this->get_logger(),
+                //             "joint %d velr %f, accr %f",
+                //             int(i),
+                //             vel_rate,
+                //             acc_rate
+                //         );
+                //     }
+                //     return itpltn;
+                // }();
+                // RCLCPP_INFO(this->get_logger(), "interpolation_num: %d", interpolation_num);
+                // for (int i = 0; i < interpolation_num && points_needed > 0; i++) {
+                //     std::array<double, 6> point;
+                //     for (size_t j = 0; j < 6; ++j) {
+                //         // don't push pre_joint
+                //         point[j] = angle_interpolation(
+                //             pre_plan_point[j],
+                //             nxt_plan_point[j],
+                //             i + 1,
+                //             interpolation_num
+                //         );
+                //     }
+                //     waypoint_vector.push_back(arr_to_waypoint(point));
+                //     pre_plan_vel = mul(minus(point, pre_plan_point), this->fps_aubo_consume);
+                //     pre_plan_point = point;
+                //     if (i == interpolation_num - 1) {
+                //         this->plan_point_queue.pop_front();
+                //     }
+                //     points_needed--;
+                // }
             }
-            return waypoint_vector;
+            return std::make_tuple(waypoint_vector, pre_sent_point, pre_sent_vel);
         }();
-        // RCLCPP_INFO(
-        //     this->get_logger(),
-        //     "in %d send %d",
-        //     int(points_size),
-        //     int(waypoint_vector.size())
-        // );
         if (waypoint_vector.empty()) {
             RCLCPP_INFO(this->get_logger(), "no points to send");
             return;
         }
         {
+            RCLCPP_INFO(this->get_logger(), "want to send %d points", int(waypoint_vector.size()));
             std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
+            RCLCPP_INFO(this->get_logger(), "lock");
             this->robot_service.robotServiceSetRobotPosData2Canbus(waypoint_vector);
+            RCLCPP_INFO(this->get_logger(), "sent");
+            std::lock_guard<std::mutex> lock_size(this->last_estimated_point_size_mutex);
             this->last_estimated_point_size += uint16_t(waypoint_vector.size());
-            this->last_sent_aubo_point = waypoint_to_arr(waypoint_vector.back());
+            this->last_sent_aubo_point = pre_sent_point;
+            this->last_sent_aubo_point_vel = pre_sent_vel;
             this->last_sent_aubo_point_id++;
             // show size
             RCLCPP_INFO(
@@ -742,10 +854,41 @@ private:
         }
     }
 
-    uint16_t get_aubo_mac_size_by_another_tcp() {
+    uint16_t get_esti_limited_point_size() {
         if (this->vm) {
             return uint16_t(this->size_expected_mac_points - 5) * 6;
         }
+        const uint16_t tcp_size = this->get_aubo_mac_size_by_another_tcp();
+        const uint16_t tcp_point = tcp_size / 6 + int(tcp_size % 6 != 0);
+        const uint16_t esti_point = this->get_aubo_point_size_by_estimate();
+        RCLCPP_INFO(
+            this->get_logger(),
+            "esti_point: %d, tcp_point: %d",
+            int(esti_point),
+            int(tcp_point)
+        );
+        return std::max(esti_point, tcp_point);
+    }
+
+    uint16_t get_aubo_point_size_by_estimate() {
+        // [last sent]
+        std::lock_guard<std::mutex> lock(this->last_estimated_point_size_mutex);
+        const auto time_interval = this->now().seconds() - this->last_estimated_point_size_time;
+        const int consumed = std::floor(time_interval * this->fps_aubo_consume);
+        this->last_estimated_point_size =
+            uint16_t(std::max(0, int(this->last_estimated_point_size) - consumed));
+        this->last_estimated_point_size_time += double(consumed) / this->fps_aubo_consume;
+        // RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "time_interval: %f, consumed: %d, last_estimated_point_size: %d",
+        //     time_interval,
+        //     consumed,
+        //     int(this->last_estimated_point_size)
+        // );
+        return this->last_estimated_point_size;
+    }
+
+    uint16_t get_aubo_mac_size_by_another_tcp() {
         std::lock_guard<std::mutex> lock(this->sub_mac_size_mutex);
         return this->sub_mac_size;
     }
@@ -798,7 +941,7 @@ private:
         return transform;
     }
 
-    std::tuple<tf2::Vector3, tf2::Quaternion> get_pose() {
+    std::tuple<tf2::Vector3, tf2::Quaternion> get_hand_pose() {
         const auto transform = this->get_transform("custom", "tracker_upright");
         return std::make_tuple(transform.getOrigin(), transform.getRotation());
     }

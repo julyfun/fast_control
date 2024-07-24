@@ -4,12 +4,15 @@
     fps_moveit_plan: 40.0
     fps_aubo_query: 40.0
     fps_aubo_consume: 200.0
-    latency_hand_to_before_plan: 0.030
+    latency_hand_to_before_plan: 0.008
     # there is time to wait for queue!!
-    latency_after_plan_others: 0.030
-    size_expected_mac_points: 10 # should least 50
-    pos_filter_q_x: 0.01
+    latency_after_plan_others: 0.010
+    size_expected_mac_points: 30 # should least 50
+    pos_filter_q_x: 0.1
     pos_filter_q_v: 100.0
-    pos_filter_r_x: 10.0
+    pos_filter_r_x: 5.0
     # hungry
     fill_to_avoid_hunger: false
+    # max vel and max acc
+    joints_deg_max_vel: [100.0, 100.0, 100.0, 200.0, 200.0, 200.0]
+    joints_deg_max_acc: [80.0, 80.0, 80.0, 160.0, 160.0, 160.0]

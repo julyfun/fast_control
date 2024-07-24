@@ -107,7 +107,7 @@ private:
                     std::vector<double> joint_positions;
                     int mac_target_pos_data_size = 0;
 
-                    // RCLCPP_INFO(this->get_logger(), "Received data: %s", complete_data.c_str());
+                    RCLCPP_INFO(this->get_logger(), "Received data: %s", complete_data.c_str());
                     this->parseJointData(
                         complete_data,
                         joint_names,
