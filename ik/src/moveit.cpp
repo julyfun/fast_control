@@ -1,7 +1,5 @@
-#include <atomic>
 #include <cstdint>
 #include <mutex>
-#include <queue>
 
 #include <moveit/collision_detection/collision_common.h>
 #include <moveit/move_group/capability_names.h>
@@ -54,8 +52,8 @@ using ::moveit::planning_interface::MoveGroupInterface;
 // const double JOINTS_ANGLE_MAX_VEL[6] = { 40.0, 40.0, 40.0, 44.0, 44.0, 44.0 };
 // div 4
 // const double JOINTS_ANGLE_MAX_VEL[6] = { 5.0, 5.0, 5.0, 5.5, 5.5, 5.5 };
-const double POS_MIN_DIFF_TO_SEND = 0.005;
-const double ANGLE_MIN_DIFF_TO_SEND = 1.0;
+// const double POS_MIN_DIFF_TO_SEND = 0.005;
+// const double ANGLE_MIN_DIFF_TO_SEND = 1.0;
 
 template<typename T, size_t N>
 std::array<T, N> minus(const std::array<T, N>& a, const std::array<T, N>& b) {
@@ -108,12 +106,12 @@ const double rad2deg(const double rad) {
 }
 
 std::array<double, 6> limited_closest_joint_angles(
-    const std::array<double, 6>& joint_angles_thats_reduced,
+    const std::array<double, 6>& pre_angles_thats_reduced,
     const std::array<double, 6>& target_angles
 ) {
     std::array<double, 6> result;
     for (size_t i = 0; i < 6; ++i) {
-        result[i] = closest_angle(joint_angles_thats_reduced[i], target_angles[i]);
+        result[i] = closest_angle(pre_angles_thats_reduced[i], target_angles[i]);
         result[i] = std::clamp(result[i], deg2rad(ANGLE_LIMIT[i][0]), deg2rad(ANGLE_LIMIT[i][1]));
     }
     return result;
@@ -179,6 +177,9 @@ private:
     // [joints max vel and max acc]
     std::array<double, 6> joints_deg_max_vel;
     std::array<double, 6> joints_deg_max_acc;
+    // [hand]
+    double hand_pos_min_diff_to_plan;
+    double hand_deg_min_diff_to_plan;
 
 public:
     explicit Ik(const rclcpp::NodeOptions& options):
@@ -248,6 +249,10 @@ public:
             return std::array<double, 6> { param[0], param[1], param[2],
                                            param[3], param[4], param[5] };
         }();
+        this->hand_pos_min_diff_to_plan =
+            this->get_parameter("hand_pos_min_diff_to_plan").as_double();
+        this->hand_deg_min_diff_to_plan =
+            this->get_parameter("hand_deg_min_diff_to_plan").as_double();
 
         // [check topic]
         {
@@ -569,12 +574,14 @@ private:
                     this->last_planned_pose.orientation.w
                 )
             );
-            if (hyp < POS_MIN_DIFF_TO_SEND && the < deg2rad(ANGLE_MIN_DIFF_TO_SEND)) {
+            // this is a very nice idea!
+            if (hyp < this->hand_pos_min_diff_to_plan
+                && the < deg2rad(this->hand_deg_min_diff_to_plan)) {
                 RCLCPP_INFO(
                     this->get_logger(),
-                    "diff too small, cancel plan. pos is %f, angle is %f",
+                    "diff too small, cancel plan. pos is %f, deg is %f",
                     hyp,
-                    the
+                    rad2deg(the)
                 );
                 RCLCPP_INFO(
                     this->get_logger(),
@@ -628,11 +635,11 @@ private:
             std::memcpy(waypoint.jointpos, arr.data(), 6 * sizeof(double));
             return waypoint;
         };
-        auto waypoint_to_arr = [](const aubo_robot_namespace::wayPoint_S& waypoint) {
-            std::array<double, 6> arr;
-            std::memcpy(arr.data(), waypoint.jointpos, 6 * sizeof(double));
-            return arr;
-        };
+        // auto waypoint_to_arr = [](const aubo_robot_namespace::wayPoint_S& waypoint) {
+        //     std::array<double, 6> arr;
+        //     std::memcpy(arr.data(), waypoint.jointpos, 6 * sizeof(double));
+        //     return arr;
+        // };
         const auto [waypoint_vector, pre_sent_point, pre_sent_vel] = [&]() {
             std::lock_guard<std::mutex> lock_plan(this->plan_points_mutex);
             // if (this->plan_points_parent_id != this->last_sent_aubo_point_id) {
@@ -669,13 +676,27 @@ private:
                     int(this->plan_point_queue.size())
                 );
                 if (this->plan_point_queue.empty()) {
-                    waypoint_vector.push_back(arr_to_waypoint(pre_sent_point));
+                    // this->plan_point_queue.push_back(pre_sent_point);
+                    waypoint_vector.push_back(arr_to_waypoint(this->last_sent_aubo_point));
+                    pre_sent_point = this->last_sent_aubo_point;
+                    // all 0
+                    pre_sent_vel = {};
                     points_needed--;
                     continue;
                 }
                 // make it close to pre_point
                 const auto nxt_plan_point =
                     limited_closest_joint_angles(this->plan_point_queue.front(), pre_sent_point);
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "nxt_plan_point: %f %f %f %f %f %f",
+                    rad2deg(nxt_plan_point[0]),
+                    rad2deg(nxt_plan_point[1]),
+                    rad2deg(nxt_plan_point[2]),
+                    rad2deg(nxt_plan_point[3]),
+                    rad2deg(nxt_plan_point[4]),
+                    rad2deg(nxt_plan_point[5])
+                );
                 // const auto nxt_plan_vel =
                 //     mul(minus(nxt_plan_point, pre_plan_point), this->fps_aubo_consume);
                 std::array<bool, 6> done;
@@ -719,45 +740,45 @@ private:
                         }
                         return so_point_is;
                     }();
-                    pre_sent_point = so_point_is;
                     // [print them]
                     {
                         std::string a;
                         for (int i = 0; i < 6; i++) {
-                            a += std::to_string(joints_acc[i] / M_PI * 180.0).substr(0, 6) + " ";
+                            a += std::to_string(joints_acc[i] / M_PI * 180.0).substr(0, 7) + " ";
                         }
                         RCLCPP_INFO(this->get_logger(), "joints_acc: %s", a.c_str());
                         std::string v;
                         for (int i = 0; i < 6; i++) {
-                            v += std::to_string(so_v_is[i] / M_PI * 180.0).substr(0, 6) + " ";
+                            v += std::to_string(so_v_is[i] / M_PI * 180.0).substr(0, 7) + " ";
                         }
                         RCLCPP_INFO(this->get_logger(), "so_v_is: %s", v.c_str());
                         std::string x;
                         for (int i = 0; i < 6; i++) {
-                            x += std::to_string(so_point_is[i] / M_PI * 180.0).substr(0, 6) + " ";
+                            x += std::to_string(so_point_is[i] / M_PI * 180.0).substr(0, 7) + " ";
                         }
                         RCLCPP_INFO(this->get_logger(), "so_point_is: %s", x.c_str());
                     }
-                    waypoint_vector.push_back(arr_to_waypoint(so_point_is));
-                    points_needed--;
                     for (int i = 0; i < 6; i++) {
-                        // check signbit
+                        // [check signbit]
+                        // RCLCPP_INFO(
+                        //     this->get_logger(),
+                        //     "%d: n %f p %f s %f",
+                        //     i,
+                        //     rad2deg(nxt_plan_point[i]),
+                        //     rad2deg(pre_sent_point[i]),
+                        //     rad2deg(so_point_is[i])
+                        // );
                         if (std::signbit(nxt_plan_point[i] - so_point_is[i])
                                 != std::signbit(nxt_plan_point[i] - pre_sent_point[i])
                             && !done[i])
                         {
                             done[i] = true;
-                            RCLCPP_INFO(
-                                this->get_logger(),
-                                "%d is done, n %f p %f s %f",
-                                i,
-                                nxt_plan_point[i],
-                                pre_sent_point[i],
-                                so_point_is[i]
-                            );
                             need_done--;
                         }
                     }
+                    waypoint_vector.push_back(arr_to_waypoint(so_point_is));
+                    points_needed--;
+                    pre_sent_point = so_point_is;
                 }
                 if (need_done == 0) {
                     RCLCPP_INFO(this->get_logger(), "need_done == 0, pop");
@@ -766,7 +787,7 @@ private:
 
                 // const int interpolation_num = [&]() {
                 //     int itpltn = 1;
-                //     for (size_t i = 0; i < 6; ++i) {\
+                //     for (size_t i = 0; i < 6; ++i) {
                 //         // 假设电机就会这样执行
                 //         const double vel = nxt_plan_vel[i];
                 //         const double vel_rate = std::abs(vel) / deg2rad(this->joint_deg_max_vel[i]);
@@ -969,20 +990,7 @@ private:
     // suppose urdf is loaded and links are specified
     std::optional<Points> get_moveit_trajectory(const std::array<double, 6>& from, const Pose& to) {
         RCLCPP_INFO(this->get_logger(), "set start state");
-        const auto start_t = std::chrono::high_resolution_clock::now();
-        auto print_t = [&start_t](const std::string& name) {
-            const auto end_t = std::chrono::high_resolution_clock::now();
-            const auto duration =
-                std::chrono::duration_cast<std::chrono::microseconds>(end_t - start_t);
-            RCLCPP_INFO(
-                rclcpp::get_logger("rclcpp"),
-                "Time taken by %s: %ld mis",
-                name.c_str(),
-                duration.count()
-            );
-        };
         { // [set start state]
-
             ::moveit::core::RobotStatePtr current_state =
                 this->move_group_interface.getCurrentState();
 
