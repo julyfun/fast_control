@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <mutex>
+#include <queue>
 
 #include <moveit/collision_detection/collision_common.h>
 #include <moveit/move_group/capability_names.h>
@@ -17,6 +18,7 @@
 #include <rclcpp/future_return_code.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <serviceinterface.h>
+#include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/int16.hpp>
 #include <sys/types.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -155,10 +157,11 @@ private:
     std::array<double, 6> last_sent_aubo_point;
     std::array<double, 6> last_sent_aubo_point_vel;
     uint64_t last_sent_aubo_point_id;
-    std::mutex last_sent_aubo_point_mutex;
+    // std::mutex last_sent_aubo_point_mutex;
     // [plan points]
     std::deque<std::array<double, 6>> plan_point_queue;
-    uint64_t plan_points_parent_id;
+    uint64_t in_plan_points_ancestor_id;
+    std::array<double, 6> last_planned_point; // maybe sent in plan_point_queue
     geometry_msgs::msg::Pose last_planned_pose;
     std::mutex plan_points_mutex;
     // [macsize estimate]
@@ -180,6 +183,9 @@ private:
     // [hand]
     double hand_pos_min_diff_to_plan;
     double hand_deg_min_diff_to_plan;
+    // [透传时间监视]
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr print_canbus_sub;
+    std::deque<double> canbus_timeq;
 
 public:
     explicit Ik(const rclcpp::NodeOptions& options):
@@ -280,12 +286,6 @@ public:
                 RCLCPP_INFO(this->get_logger(), "Got planning scene");
             }
         }
-        // psm->startWorldGeometryMonitor();
-        // psm->startStateMonitor();
-        // {
-        //     using namespace std::chrono_literals;
-        //     rclcpp::sleep_for(2s);
-        // }
 
         // [timer]
         {
@@ -334,6 +334,8 @@ public:
                     init_joints +=
                         std::to_string(this->last_sent_aubo_point[i] / M_PI * 180.0) + " ";
                 }
+                this->last_planned_point = this->last_sent_aubo_point;
+                this->in_plan_points_ancestor_id = 0;
                 RCLCPP_INFO(this->get_logger(), "init joints %s", init_joints.c_str());
             } else {
                 RCLCPP_ERROR(this->get_logger(), "get joint status failed");
@@ -485,9 +487,29 @@ public:
             this->last_estimated_point_size = 0;
             this->last_estimated_point_size_time = this->now().seconds();
         }
+
+        {
+            this->print_canbus_sub = this->create_subscription<std_msgs::msg::Empty>(
+                "/ik/pct",
+                10,
+                [this](std_msgs::msg::Empty::SharedPtr msg) { this->print_that(msg); }
+            );
+        }
     }
 
 private:
+    void print_that(std_msgs::msg::Empty::SharedPtr) {
+        std::string res;
+        for (const auto& time: this->canbus_timeq) {
+            res += std::to_string(time * 1000) + " ";
+        }
+        RCLCPP_INFO(
+            this->get_logger(),
+            "size: %d canbus_timeq: %s",
+            int(this->canbus_timeq.size()),
+            res.c_str()
+        );
+    }
     void callback_internal_ik() {
         //
         const auto [pos, ori] = this->get_hand_pose();
@@ -531,11 +553,11 @@ private:
             { 0.2, 0.15, 1.0, ratio }
         );
 
-        const auto [this_plan_parent_id, from] = [&]() {
-            std::lock_guard<std::mutex> lock(this->last_sent_aubo_point_mutex);
-            const auto parent_id = this->last_sent_aubo_point_id;
-            const auto from = this->last_sent_aubo_point;
-            return std::make_tuple(parent_id, from);
+        const auto [this_plan_ancestor_id, from] = [&]() {
+            // std::lock_guard<std::mutex> lock(this->last_sent_aubo_point_mutex); // 不需要锁 sent aubo point
+            const auto ancestor_id = this->in_plan_points_ancestor_id;
+            const auto from = this->last_planned_point;
+            return std::make_tuple(ancestor_id, from);
         }();
         const auto ori_here = ori;
         const auto to = [&] {
@@ -590,17 +612,21 @@ private:
                 );
                 return;
             }
-
+            // 仅用于判断是否应该 plan，并不参与 plan 初值。居然割裂了 planned_pose 和 sent_pose，好吧这样也还可以
+            // 毕竟最近一次 plan 是绝对的优先级最高，要想尽办法快速到达
             this->last_planned_pose = to;
-            if (this->plan_points_parent_id != this_plan_parent_id) {
-                while (!this->plan_point_queue.empty()) {
-                    this->plan_point_queue.pop_front();
-                }
+            // if (this->plan_points_parent_id != this_plan_parent_id) {
+            //     while (!this->plan_point_queue.empty()) {
+            //         this->plan_point_queue.pop_front();
+            //     }
+            // }
+            while (!this->plan_point_queue.empty()) {
+                this->plan_point_queue.pop_front();
             }
             this->plan_point_queue.push_back(point.value());
             // this->last_sent_aubo_point = point;
             // this->moveit_points_queue.push(poin);
-            this->plan_points_parent_id = this->last_sent_aubo_point_id;
+            this->in_plan_points_ancestor_id = this_plan_ancestor_id; // no use at all
         }
     }
 
@@ -641,14 +667,17 @@ private:
         //     return arr;
         // };
         const auto [waypoint_vector, pre_sent_point, pre_sent_vel] = [&]() {
+            // 这里要锁住，plan 线程会修改相关变量
             std::lock_guard<std::mutex> lock_plan(this->plan_points_mutex);
-            // if (this->plan_points_parent_id != this->last_sent_aubo_point_id) {
+            // [这里之前用的 moveit plan，规划起点必须是上一个规划终点。现在换成直接 ik 了以后就没这必要了]
+            // if (this->plan_points_parent_id != this->last_sent_aubo_point_id) { // should be something like current_plan ancestor id
             //     while (!this->plan_point_queue.empty()) {
             //         this->plan_point_queue.pop_front();
             //     } // 必须防止饥饿，就算数据没用都要送过去一堆老的
             // }
             std::vector<aubo_robot_namespace::wayPoint_S> waypoint_vector;
-            std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
+            // [todo] 此处只读，需要锁吗？只有本线程会修改和读取它，所以不用锁！
+            // std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
             auto pre_sent_point = this->last_sent_aubo_point;
             auto pre_sent_vel = this->last_sent_aubo_point_vel;
 
@@ -792,7 +821,6 @@ private:
                 //         const double vel = nxt_plan_vel[i];
                 //         const double vel_rate = std::abs(vel) / deg2rad(this->joint_deg_max_vel[i]);
                 //         itpltn = std::max(itpltn, int(ceil(vel_rate)));
-                //         // [todo] 加速度不是线性插值吧
                 //         const double acc = (vel - pre_plan_vel[i]) * this->fps_aubo_consume;
                 //         const double acc_rate =
                 //             std::abs(acc) / deg2rad(JOINTS_ANGLE_MAX_ACC_DEG[i]);
@@ -845,15 +873,29 @@ private:
         }
         {
             RCLCPP_INFO(this->get_logger(), "want to send %d points", int(waypoint_vector.size()));
-            std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
+            // std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex); // 只有本线程修改和读取它，不锁
             RCLCPP_INFO(this->get_logger(), "lock");
+
+            const auto now = this->now().seconds();
+
             this->robot_service.robotServiceSetRobotPosData2Canbus(waypoint_vector);
+
+            const auto p = this->now().seconds() - now;
+            if (p > 0.100) {
+                RCLCPP_WARN(this->get_logger(), "#too-long! %f ms", p * 1000);
+            }
+
+            if (this->canbus_timeq.size() >= 10000) {
+                this->canbus_timeq.pop_front();
+            }
+            this->canbus_timeq.push_back(p);
+
             RCLCPP_INFO(this->get_logger(), "sent");
             std::lock_guard<std::mutex> lock_size(this->last_estimated_point_size_mutex);
             this->last_estimated_point_size += uint16_t(waypoint_vector.size());
             this->last_sent_aubo_point = pre_sent_point;
             this->last_sent_aubo_point_vel = pre_sent_vel;
-            this->last_sent_aubo_point_id++;
+            this->last_sent_aubo_point_id++; // of no use at all
             // show size
             RCLCPP_INFO(
                 this->get_logger(),
