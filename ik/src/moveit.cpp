@@ -186,6 +186,9 @@ private:
     // [透传时间监视]
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr print_canbus_sub;
     std::deque<double> canbus_timeq;
+    std::mutex canbus_timeq_mutex;
+    // [always-sent-start mode] don't plan
+    bool mode_no_plan;
 
 public:
     explicit Ik(const rclcpp::NodeOptions& options):
@@ -259,6 +262,7 @@ public:
             this->get_parameter("hand_pos_min_diff_to_plan").as_double();
         this->hand_deg_min_diff_to_plan =
             this->get_parameter("hand_deg_min_diff_to_plan").as_double();
+        this->mode_no_plan = this->get_parameter("mode_no_plan").as_bool();
 
         // [check topic]
         {
@@ -308,9 +312,10 @@ public:
         // [robot init]
         {
             // const char* host = "192.168.1.7";
-            const char* host = "192.168.1.7";
-            const int port = 8899;
-            const int ret = this->robot_service.robotServiceLogin(host, port, "aubo", "123456");
+            const auto host = this->get_parameter("aubo_ip").as_string();
+            const int port = this->get_parameter("aubo_service_port").as_int();
+            const int ret =
+                this->robot_service.robotServiceLogin(host.c_str(), port, "aubo", "123456");
             if (ret == aubo_robot_namespace::InterfaceCallSuccCode) {
                 RCLCPP_INFO(this->get_logger(), "login success.");
             } else {
@@ -499,19 +504,21 @@ public:
 
 private:
     void print_that(std_msgs::msg::Empty::SharedPtr) {
+        this->canbus_timeq_mutex.lock();
         std::string res;
         for (const auto& time: this->canbus_timeq) {
             res += std::to_string(time * 1000) + " ";
         }
-        RCLCPP_INFO(
-            this->get_logger(),
-            "size: %d canbus_timeq: %s",
-            int(this->canbus_timeq.size()),
-            res.c_str()
-        );
+        this->canbus_timeq_mutex.unlock();
+        std::ofstream file(std::string(std::getenv("HOME")) + "/.teleop/data.txt", std::ios::out);
+        file << res;
+        file.close();
     }
     void callback_internal_ik() {
-        //
+        if (this->mode_no_plan) {
+            return;
+        }
+
         const auto [pos, ori] = this->get_hand_pose();
         const double ts_before_plan = this->now().seconds();
         const auto ts_estimated_hand = ts_before_plan - this->latency_hand_to_before_plan;
@@ -546,8 +553,13 @@ private:
         };
 
         const double ratio = 1.0;
+        const auto time1 = this->now().seconds();
+        const bool enable_pose_filter = this->get_parameter("enable_pose_filter").as_bool();
+        const auto time2 = this->now().seconds();
+        RCLCPP_INFO(this->get_logger(), "get_parameter(): %f", time2 - time1);
         const auto out_esti_pos = out_pos(
-            pos_estimated_effector,
+            enable_pose_filter ? pos_estimated_effector
+                               : Eigen::Vector3<double> { pos.x(), pos.y(), pos.z() },
             { +0.4, -0.7, 0.7, ratio },
             { 0, -1.8, 1.8, ratio },
             { 0.2, 0.15, 1.0, ratio }
@@ -885,12 +897,14 @@ private:
                 RCLCPP_WARN(this->get_logger(), "#too-long! %f ms", p * 1000);
             }
 
+            this->canbus_timeq_mutex.lock();
             if (this->canbus_timeq.size() >= 10000) {
                 this->canbus_timeq.pop_front();
             }
             this->canbus_timeq.push_back(p);
+            this->canbus_timeq_mutex.unlock();
+            RCLCPP_INFO(this->get_logger(), "sent time: %f", p);
 
-            RCLCPP_INFO(this->get_logger(), "sent");
             std::lock_guard<std::mutex> lock_size(this->last_estimated_point_size_mutex);
             this->last_estimated_point_size += uint16_t(waypoint_vector.size());
             this->last_sent_aubo_point = pre_sent_point;

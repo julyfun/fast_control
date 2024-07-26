@@ -7,7 +7,7 @@
     latency_hand_to_before_plan: 0.008
     # there is time to wait for queue!!
     latency_after_plan_others: 0.040
-    size_expected_mac_points: 30 # should least 50
+    size_expected_mac_points: 15 # should least 50
     pos_filter_q_x: 0.1
     pos_filter_q_v: 100.0
     pos_filter_r_x: 5.0
@@ -19,3 +19,10 @@
     # hand min diff to plan
     hand_pos_min_diff_to_plan: 0.005
     hand_deg_min_diff_to_plan: 1.0
+    # [silent mode]
+    mode_no_plan: false
+    # [aubo ip]
+    aubo_ip: "192.168.1.7"
+    aubo_service_port: 8899
+    # [precition]
+    enable_pose_filter: false
