@@ -6,16 +6,16 @@
     fps_aubo_consume: 200.0
     latency_hand_to_before_plan: 0.008
     # there is time to wait for queue!!
-    latency_after_plan_others: 0.040
-    size_expected_mac_points: 15 # should least 50
+    latency_after_plan_others: 0.008
+    size_expected_mac_points: 12 # should least 50
     pos_filter_q_x: 0.1
     pos_filter_q_v: 100.0
     pos_filter_r_x: 5.0
     # hungry
     fill_to_avoid_hunger: false
     # max vel and max acc
-    joints_deg_max_vel: [40.0, 40.0, 40.0, 80.0, 80.0, 80.0]
-    joints_deg_max_acc: [80.0, 80.0, 80.0, 160.0, 160.0, 160.0]
+    joints_deg_max_vel: [150.0, 150.0, 150.0, 240.0, 240.0, 240.0]
+    joints_deg_max_acc: [300.0, 300.0, 300.0, 360.0, 360.0, 360.0]
     # hand min diff to plan
     hand_pos_min_diff_to_plan: 0.005
     hand_deg_min_diff_to_plan: 1.0
