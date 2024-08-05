@@ -6,16 +6,16 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     config = os.path.join(
-        get_package_share_directory('ik'), 'config', 'ik_moveit_vm.yaml'
+        get_package_share_directory('ik'), 'config', 'ik_moveit_vmware.yaml'
     )
-    ik_moveit_node = Node(
+    ik_joint_broadcaster_node = Node(
         package='ik',
-        executable='ik_moveit_exe',
-        name='ik_moveit_vm',
+        executable='ik_joint_broadcaster_exe',
+        name='ik_joint_broadcaster_vmware',
         output='screen',
         parameters=[config]
     )
 
     return LaunchDescription([
-        ik_moveit_node,
+        ik_joint_broadcaster_node,
     ])

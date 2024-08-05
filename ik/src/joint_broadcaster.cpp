@@ -51,18 +51,30 @@
 
 namespace ik::joint_broadcaster {
 
-std::string tcp_ip = "192.168.1.7";
 int tcp_port = 8891;
+
+using std::string;
 
 class JointBroadcaster: public rclcpp::Node {
 private:
+    // [meta]
+    string group_name;
+    string aubo_ip;
+    // [pub]
     rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr mac_target_pos_data_size_pub;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub;
     int sock;
 
 public:
     explicit JointBroadcaster(const rclcpp::NodeOptions& options):
-        Node("aubo_state_broadcaster", options) {
+        Node(
+            "fake_joint_ik_broadcaster",
+            rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true)
+        ),
+        group_name(this->get_parameter("group_name").as_string()),
+        aubo_ip(this->get_parameter("aubo_ip").as_string())
+    //
+    {
         RCLCPP_INFO(this->get_logger(), "hello");
         std::thread(&JointBroadcaster::call_me_once, this).detach();
     };
@@ -71,13 +83,17 @@ public:
 
 private:
     void call_me_once() {
-        this->mac_target_pos_data_size_pub =
-            this->create_publisher<std_msgs::msg::Int16>("/mac_target_pos_data_size", 10);
+        this->mac_target_pos_data_size_pub = this->create_publisher<std_msgs::msg::Int16>(
+            "/" + this->group_name + "_mac_target_pos_data_size",
+            10
+        );
         // this->joint_pub = nh.advertise<sensor_msgs::JointState>("/joint_states", 10);
-        this->joint_pub =
-            this->create_publisher<sensor_msgs::msg::JointState>("/aubo_joint_states", 10);
+        this->joint_pub = this->create_publisher<sensor_msgs::msg::JointState>(
+            "/" + this->group_name + "_aubo_joint_states",
+            10
+        );
 
-        int sock = this->connectToServer(tcp_ip, tcp_port);
+        int sock = this->connectToServer(this->aubo_ip, tcp_port);
         if (sock < 0) {
             RCLCPP_ERROR(this->get_logger(), "Failed to connect to server.");
             return;
@@ -145,10 +161,10 @@ private:
 
                 RCLCPP_WARN(this->get_logger(), "Failed to read data from socket. Reconnecting...");
                 close(sock);
-                sock = connectToServer(tcp_ip, tcp_port);
+                sock = connectToServer(this->aubo_ip, tcp_port);
                 while (sock < 0 && rclcpp::ok()) {
                     rclcpp::sleep_for(std::chrono::seconds(1));
-                    sock = connectToServer(tcp_ip, tcp_port);
+                    sock = connectToServer(this->aubo_ip, tcp_port);
                 }
             }
             memset(buffer, 0, sizeof(buffer));

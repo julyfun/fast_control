@@ -1,6 +1,8 @@
-/ik_moveit:
+ik_moveit_real:
   ros__parameters:
-    vm: false
+    # [meta]
+    # [control]
+    check_joint_broadcaster: false
     fps_moveit_plan: 40.0
     fps_aubo_query: 40.0
     fps_aubo_consume: 200.0
@@ -11,8 +13,6 @@
     pos_filter_q_x: 0.1
     pos_filter_q_v: 100.0
     pos_filter_r_x: 5.0
-    # hungry
-    fill_to_avoid_hunger: false
     # max vel and max acc
     joints_deg_max_vel: [150.0, 150.0, 150.0, 240.0, 240.0, 240.0]
     joints_deg_max_acc: [300.0, 300.0, 300.0, 360.0, 360.0, 360.0]
@@ -22,7 +22,13 @@
     # [silent mode]
     mode_no_plan: false
     # [aubo ip]
-    aubo_ip: "192.168.1.7"
     aubo_service_port: 8899
     # [precition]
     enable_pose_filter: false
+
+
+/**:
+  ros__parameters:
+    # [meta]
+    group_name: "right_dual2"
+    aubo_ip: "192.168.1.7"

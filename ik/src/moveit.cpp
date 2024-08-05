@@ -16,6 +16,7 @@
 #include <moveit_visual_tools/moveit_visual_tools.h>
 #include <rclcpp/executor.hpp>
 #include <rclcpp/future_return_code.hpp>
+#include <rclcpp/publisher.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <serviceinterface.h>
 #include <std_msgs/msg/empty.hpp>
@@ -121,6 +122,8 @@ std::array<double, 6> limited_closest_joint_angles(
 
 class Ik: public rclcpp::Node {
 private:
+    // [meta]
+    std::string group_name;
     // [tf]
     tf2_ros::Buffer tf_buffer;
     tf2_ros::TransformListener tf_listener;
@@ -173,10 +176,8 @@ private:
     double q_x;
     double q_v;
     double r_x;
-    // [hungry]
-    bool fill_to_avoid_hunger;
     // [vm]
-    bool vm;
+    bool check_joint_broadcaster;
     // [joints max vel and max acc]
     std::array<double, 6> joints_deg_max_vel;
     std::array<double, 6> joints_deg_max_acc;
@@ -189,20 +190,23 @@ private:
     std::mutex canbus_timeq_mutex;
     // [always-sent-start mode] don't plan
     bool mode_no_plan;
+    // [joint cmd test]
+    rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr joint_cmd_pub;
 
 public:
     explicit Ik(const rclcpp::NodeOptions& options):
         Node(
-            "ik_moveit",
+            "fake_ik_moveit",
             rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true)
         ),
+        group_name(this->get_parameter("group_name").as_string()),
         tf_buffer(this->get_clock()),
         tf_listener(this->tf_buffer),
         // [moveit]
         node_for_move_group(std::make_shared<rclcpp::Node>("node_for_move_group")),
-        move_group_interface(node_for_move_group, "classic_six"),
+        move_group_interface(node_for_move_group, this->group_name),
         joint_model_group([&]() {
-            return this->move_group_interface.getRobotModel()->getJointModelGroup("classic_six");
+            return this->move_group_interface.getRobotModel()->getJointModelGroup(this->group_name);
         }()),
         // [t.like inter]
         node_for_srv(std::make_shared<rclcpp::Node>("node_for_srv")),
@@ -214,12 +218,16 @@ public:
         )),
         // [aubo.libtopic]
         mac_size_sub(this->create_subscription<std_msgs::msg::Int16>(
-            "/mac_target_pos_data_size",
+            "/" + this->group_name + "_mac_target_pos_data_size",
             10,
             [this](const std_msgs::msg::Int16::SharedPtr msg) {
                 std::lock_guard<std::mutex> lock(this->sub_mac_size_mutex);
                 this->sub_mac_size = msg->data;
             }
+        )),
+        joint_cmd_pub(this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
+            "/" + this->group_name + "_controller/joint_trajectory",
+            10
         ))
     // [t.service]
     // 太抽象
@@ -246,8 +254,7 @@ public:
         this->latency_after_plan_others =
             this->get_parameter("latency_after_plan_others").as_double();
         this->size_expected_mac_points = this->get_parameter("size_expected_mac_points").as_int();
-        this->vm = this->get_parameter("vm").as_bool();
-        this->fill_to_avoid_hunger = this->get_parameter("fill_to_avoid_hunger").as_bool();
+        this->check_joint_broadcaster = this->get_parameter("check_joint_broadcaster").as_bool();
         this->joints_deg_max_vel = [&]() {
             const auto param = this->get_parameter("joints_deg_max_vel").as_double_array();
             return std::array<double, 6> { param[0], param[1], param[2],
@@ -266,8 +273,9 @@ public:
 
         // [check topic]
         {
-            if (!this->vm) {
-                int has_message = this->count_publishers("/mac_target_pos_data_size");
+            if (this->check_joint_broadcaster) {
+                int has_message =
+                    this->count_publishers("/" + this->group_name + "_mac_target_pos_data_size");
                 if (has_message == 0) {
                     RCLCPP_ERROR(this->get_logger(), "No publisher for /mac_target_pos_data_size");
                     return;
@@ -311,7 +319,6 @@ public:
 
         // [robot init]
         {
-            // const char* host = "192.168.1.7";
             const auto host = this->get_parameter("aubo_ip").as_string();
             const int port = this->get_parameter("aubo_service_port").as_int();
             const int ret =
@@ -378,13 +385,6 @@ public:
 
                 return collision_object;
             }();
-
-            // [load]
-
-            // auto moveit_cpp = std::make_shared<moveit_cpp::MoveItCpp>(node_for_move_group);
-            // moveit_cpp->getPlanningSceneMonitor()->providePlanningSceneService();
-            // ::moveit::planning_interface::PlanningSceneInterface planning_scene_interface(moveit_cpp
-            // );
             // [old]
             ::moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
             planning_scene_interface.applyCollisionObject(collision_object);
@@ -392,33 +392,9 @@ public:
             for (const auto& object: planning_scene_interface.getObjects()) {
                 RCLCPP_INFO(this->get_logger(), "Object: %s", object.first.c_str());
             }
-
-            // [t.monitor]
-            // auto current_state = move_group_interface.getCurrentState();
-            // RCLCPP_INFO(
-            //     this->get_logger(),
-            //     "desk type %s",
-            //     planning_scene_monitor::LockedPlanningSceneRO(this->psm)
-            //         ->getObjectType("desk")
-            //         .db.c_str()
-            // );
-
-            // [t.monitor]
-            // RCLCPP_INFO(this->get_logger(), "<<<");
-            // rclcpp::sleep_for(std::chrono::seconds(1));
-            // this->psm->updateSceneWithCurrentState();
-            // RCLCPP_INFO(
-            //     this->get_logger(),
-            //     "%s",
-            //     psm->getPlanningScene()->getObjectType("desk").db.c_str()
-            // );
-            // RCLCPP_INFO(this->get_logger(), ">>>");
-
-            // [t.local]
-            // ::moveit::PlanningScene planning_scene(this->move_group_interface.getRobotModel());
-
             // [t.like inter]
             {
+                // 这部分模仿 PlanningInterface 实现物体查询
                 RCLCPP_INFO(this->get_logger(), "[t.like inter]");
                 this->ps_srv =
                     this->node_for_srv->create_client<moveit_msgs::srv::GetPlanningScene>(
@@ -584,9 +560,16 @@ private:
         const auto point = this->get_internal_ik(from, to);
 
         if (point.has_value()) {
-            if (this->collide(point.value())) {
+            auto start = std::chrono::high_resolution_clock::now();
+            if (this->collide_or_outofrange(point.value())) {
                 return;
             }
+            RCLCPP_INFO(
+                this->get_logger(),
+                "collide check time: %f",
+                std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start)
+                    .count()
+            );
             std::lock_guard<std::mutex> lock(this->plan_points_mutex);
             // check trans and angular dis
             const double hyp = std::hypot(
@@ -642,7 +625,19 @@ private:
         }
     }
 
-    bool collide(const std::array<double, 6>& joint_angles) {
+    bool collide_or_outofrange(const std::array<double, 6>& joint_angles) {
+        for (size_t i = 0; i < 6; ++i) {
+            if (joint_angles[i] < deg2rad(ANGLE_LIMIT[i][0])
+                || joint_angles[i] > deg2rad(ANGLE_LIMIT[i][1])) {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Joint %d out of range: %f",
+                    int(i),
+                    rad2deg(joint_angles[i])
+                );
+                return true;
+            }
+        }
         using namespace collision_detection;
         CollisionRequest request;
         CollisionResult result;
@@ -653,6 +648,7 @@ private:
         // ::moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
         auto robot_state = planning_scene->getCurrentStateNonConst();
         robot_state.setJointGroupPositions(this->joint_model_group, joint_angles.data());
+        // how to broadcast it to planning scene?
         planning_scene->checkSelfCollision(request, result, robot_state);
         if (result.collision) {
             RCLCPP_ERROR(this->get_logger(), "Self Collision!");
@@ -668,7 +664,7 @@ private:
 
     void callback_aubo_query() {
         const auto points_size = this->get_esti_limited_point_size();
-        auto arr_to_waypoint = [](const std::array<double, 6>& arr) {
+        const auto arr_to_waypoint = [](const std::array<double, 6>& arr) {
             aubo_robot_namespace::wayPoint_S waypoint;
             std::memcpy(waypoint.jointpos, arr.data(), 6 * sizeof(double));
             return waypoint;
@@ -709,8 +705,9 @@ private:
             // }();
             // RCLCPP_INFO(this->get_logger(), "points_needed: %d", points_needed);
 
-            // [Try to consume a plan]
-            while (points_needed > 0) {
+            // [Try to consume a plan in each loop]
+            bool ok_no_collide = true;
+            while (ok_no_collide && points_needed > 0) {
                 RCLCPP_INFO(
                     this->get_logger(),
                     "In query, plan size: %d",
@@ -745,7 +742,7 @@ private:
                 std::fill(done.begin(), done.end(), false);
 
                 // [generate a sent point]
-                while (points_needed > 0 && need_done > 0) {
+                while (ok_no_collide && points_needed > 0 && need_done > 0) {
                     const std::array<double, 6> joints_acc = [&]() {
                         std::array<double, 6> joints_acc = {};
                         auto sign = [](const double some) { return some > 0 ? 1 : -1; };
@@ -816,6 +813,10 @@ private:
                             done[i] = true;
                             need_done--;
                         }
+                    }
+                    if (this->collide_or_outofrange(so_point_is)) {
+                        ok_no_collide = false;
+                        break;
                     }
                     waypoint_vector.push_back(arr_to_waypoint(so_point_is));
                     points_needed--;
@@ -910,6 +911,33 @@ private:
             this->last_sent_aubo_point = pre_sent_point;
             this->last_sent_aubo_point_vel = pre_sent_vel;
             this->last_sent_aubo_point_id++; // of no use at all
+
+            // {
+            //     // [only for test]
+            //     auto current_state = this->move_group_interface.getCurrentState();
+            //     std::vector<double> last_reduced;
+            //     for (size_t i = 0; i < 6; ++i) {
+            //         last_reduced.push_back(reduced_angle(this->last_sent_aubo_point[i]));
+            //     }
+            //     current_state->setJointGroupPositions(this->joint_model_group, last_reduced);
+            //     this->move_group_interface.setJointValueTarget(*current_state);
+            //     this->move_group_interface.move();
+            // }
+
+            {
+                // [only for test]
+                trajectory_msgs::msg::JointTrajectory traj_msg;
+                traj_msg.joint_names = this->joint_model_group->getVariableNames();
+                trajectory_msgs::msg::JointTrajectoryPoint point;
+                point.positions = std::vector<double>(
+                    this->last_sent_aubo_point.begin(),
+                    this->last_sent_aubo_point.end()
+                );
+                point.time_from_start = rclcpp::Duration::from_seconds(0.01);
+                traj_msg.points.push_back(point);
+                this->joint_cmd_pub->publish(traj_msg);
+            }
+
             // show size
             RCLCPP_INFO(
                 this->get_logger(),
@@ -932,7 +960,7 @@ private:
     }
 
     uint16_t get_esti_limited_point_size() {
-        if (this->vm) {
+        if (this->check_joint_broadcaster) {
             return uint16_t(this->size_expected_mac_points - 5) * 6;
         }
         const uint16_t tcp_size = this->get_aubo_mac_size_by_another_tcp();
@@ -974,7 +1002,7 @@ private:
         // count time here
         using namespace std::chrono;
 
-        if (this->vm) {
+        if (this->check_joint_broadcaster) {
             return uint16_t(this->size_expected_mac_points - 5) * 6;
         }
 
