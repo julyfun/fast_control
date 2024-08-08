@@ -7,6 +7,7 @@ ik_moveit_vm:
     fps_aubo_query: 40.0
     fps_aubo_consume: 200.0
     latency_hand_to_before_plan: 0.008
+    right_arm: false # 左臂反转 y
     # there is time to wait for queue!!
     latency_after_plan_others: 0.008
     size_expected_mac_points: 12 # should least 50
@@ -16,9 +17,11 @@ ik_moveit_vm:
     # max vel and max acc
     joints_deg_max_vel: [150.0, 150.0, 150.0, 240.0, 240.0, 240.0]
     joints_deg_max_acc: [300.0, 300.0, 300.0, 360.0, 360.0, 360.0]
-    # hand min diff to plan
+    # hand min diff for planning
     hand_pos_min_diff_to_plan: 0.005
     hand_deg_min_diff_to_plan: 1.0
+    # [ik] kdl, internal
+    ik_method: "kdl"
     # [silent mode]
     mode_no_plan: false
     # [aubo ip]

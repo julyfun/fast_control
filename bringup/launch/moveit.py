@@ -16,6 +16,18 @@ def generate_launch_description():
         parameters=[config]
     )
 
+    config2 = os.path.join(
+        get_package_share_directory('ik'), 'config', 'ik_moveit_real.yaml'
+    )
+    ik_moveit_node2 = Node(
+        package='ik',
+        executable='ik_moveit_exe',
+        name='ik_moveit_real',
+        output='screen',
+        parameters=[config2]
+    )
+
     return LaunchDescription([
         ik_moveit_node,
+        # ik_moveit_node2,
     ])
