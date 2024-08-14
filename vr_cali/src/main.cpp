@@ -16,6 +16,7 @@
 #include <rclcpp/utilities.hpp>
 #include <std_msgs/msg/detail/empty__struct.hpp>
 #include <std_msgs/msg/empty.hpp>
+#include <std_msgs/msg/int32.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Transform.h>
@@ -31,6 +32,7 @@
 // #include <Poco/Net/ServerSocket.h> // system
 
 namespace vr_cali {
+using std::to_string;
 
 tf2::Vector3 axis_under(const tf2::Vector3& a, const tf2::Vector3& b, const tf2::Transform& trans) {
     auto new_a = trans * a;
@@ -56,9 +58,8 @@ inline bool ignore(std::fstream& fin, const std::string& str) {
             // std::cout << "!match: " << char_cache << " " << str[str_cache.size()]
             // << " " << str_cache.size() << std::endl;
         }
-        // std::cout << str_cache << std::endl;
-        if (str_cache.size() == str.size())
-            return true;
+        // std::cout << str_cache << std::endl; if (str_cache.size() == str.size())
+        return true;
     }
     return false;
 }
@@ -75,13 +76,13 @@ private:
     // std::optional<tf2::Quaternion> upright_quaternion;
     // need a quaternion
 
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr p0_sub;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr px_sub;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr py_sub;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr p0_sub;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr px_sub;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr py_sub;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr cali_fixed_sub;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr tracker_upright_sub;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr save_sub;
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr load_sub;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr tracker_upright_sub;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr save_sub;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr load_sub;
 
 public:
     explicit VrCali(const rclcpp::NodeOptions& options):
@@ -92,97 +93,70 @@ public:
     {
         RCLCPP_INFO(this->get_logger(), "Node has been started.");
 
-        this->p0_sub = this->create_subscription<std_msgs::msg::Empty>(
+        this->p0_sub = this->create_subscription<std_msgs::msg::Int32>(
             "/cali/p0",
             10,
-            [this](std_msgs::msg::Empty::SharedPtr msg) { this->record_p0(msg); }
+            [this](std_msgs::msg::Int32::SharedPtr msg) { this->record_p0(msg); }
         );
-        this->px_sub = this->create_subscription<std_msgs::msg::Empty>(
+        this->px_sub = this->create_subscription<std_msgs::msg::Int32>(
             "/cali/px",
             10,
-            [this](std_msgs::msg::Empty::SharedPtr msg) { this->record_px(msg); }
+            [this](std_msgs::msg::Int32::SharedPtr msg) { this->record_px(msg); }
         );
-        this->py_sub = this->create_subscription<std_msgs::msg::Empty>(
+        this->py_sub = this->create_subscription<std_msgs::msg::Int32>(
             "/cali/py",
             10,
-            [this](std_msgs::msg::Empty::SharedPtr msg) { this->record_py(msg); }
+            [this](std_msgs::msg::Int32::SharedPtr msg) { this->record_py(msg); }
         );
         this->cali_fixed_sub = this->create_subscription<std_msgs::msg::Empty>(
             "/cali/cali_fixed",
             10,
             [this](std_msgs::msg::Empty::SharedPtr msg) { this->cali_fixed(msg); }
         );
-        this->tracker_upright_sub = this->create_subscription<std_msgs::msg::Empty>(
+        this->tracker_upright_sub = this->create_subscription<std_msgs::msg::Int32>(
             "/cali/upright",
             10,
-            [this](std_msgs::msg::Empty::SharedPtr msg) { this->tracker_upright(msg); }
+            [this](std_msgs::msg::Int32::SharedPtr msg) { this->tracker_upright(msg); }
         );
-        this->save_sub = this->create_subscription<std_msgs::msg::Empty>(
+        this->save_sub = this->create_subscription<std_msgs::msg::Int32>(
             "/cali/save",
             10,
-            [this](std_msgs::msg::Empty::SharedPtr msg) { this->save_yaml(msg); }
+            [this](std_msgs::msg::Int32::SharedPtr msg) { this->save_yaml(msg); }
         );
-        this->load_sub = this->create_subscription<std_msgs::msg::Empty>(
+        this->load_sub = this->create_subscription<std_msgs::msg::Int32>(
             "/cali/load",
             10,
-            [this](std_msgs::msg::Empty::SharedPtr msg) { this->load_yaml(msg); }
+            [this](std_msgs::msg::Int32::SharedPtr msg) { this->load_yaml(msg); }
         );
     }
 
     ~VrCali() override = default;
 
 private:
-    void tracker_upright(const std_msgs::msg::Empty::SharedPtr msg) {
+    void tracker_upright(const std_msgs::msg::Int32::SharedPtr msg) {
         RCLCPP_INFO(this->get_logger(), "Try to calibrate upright.");
-        auto rotation_matrix = this->get_rotation("tracker_random", "custom");
+        auto rotation_matrix =
+            this->get_rotation("tracker_random" + std::to_string(msg->data), "custom");
         const auto translation_vector = tf2::Vector3(0.0, 0, 0);
         const auto transform = tf2::Transform(rotation_matrix, translation_vector);
         auto upright_quaternion = transform.getRotation();
         geometry_msgs::msg::TransformStamped transform_stamped;
         transform_stamped.header.stamp = this->now();
-        transform_stamped.header.frame_id = "tracker_random"; // target
-        transform_stamped.child_frame_id = "tracker_upright"; // source
+        transform_stamped.header.frame_id = "tracker_random" + std::to_string(msg->data); // target
+        transform_stamped.child_frame_id = "tracker_upright" + std::to_string(msg->data); // source
         transform_stamped.transform.translation = tf2::toMsg(transform.getOrigin());
         transform_stamped.transform.rotation = tf2::toMsg(upright_quaternion);
         this->tf_br.sendTransform(transform_stamped); // 可能重新标定, so not static
     }
 
-    void save_os(const std_msgs::msg::Empty::SharedPtr msg) {
-        RCLCPP_INFO(this->get_logger(), "Try to save.");
-        geometry_msgs::msg::TransformStamped transform_stamped;
-        try {
-            const auto file_name = [&]() {
-                const char* home = std::getenv("HOME");
-                return std::string(home) + "/.teleop/cali.csv";
-            }();
-            std::ofstream file(file_name, std::ios::out);
-            const auto out_trans = [&](const std::string& target_frame,
-                                       const std::string& source_frame) {
-                transform_stamped =
-                    this->tf_buffer.lookupTransform(target_frame, source_frame, tf2::TimePointZero);
-                file << "translation: " << transform_stamped.transform.translation.x << " "
-                     << transform_stamped.transform.translation.y << " "
-                     << transform_stamped.transform.translation.z << "\n";
-                file << "rotation: " << transform_stamped.transform.rotation.x << " "
-                     << transform_stamped.transform.rotation.y << " "
-                     << transform_stamped.transform.rotation.z << " "
-                     << transform_stamped.transform.rotation.w << "\n";
-            };
-            out_trans("ref", "custom");
-            out_trans("tracker_random", "tracker_upright");
-            file.close();
-        } catch (tf2::TransformException& ex) {
-            RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
-        }
-    }
-
-    void save_yaml(const std_msgs::msg::Empty::SharedPtr msg) {
+    // msg is total
+    void save_yaml(const std_msgs::msg::Int32::SharedPtr msg) {
         RCLCPP_INFO(this->get_logger(), "Try to save.");
         try {
             using std::string;
             const auto file_name = [&]() {
                 const char* home = std::getenv("HOME");
-                return std::string(home) + "/.teleop/cali.yaml";
+                return std::string(home) + "/.teleop/cali" + to_string(msg->data) + ".yaml";
             }();
             YAML::Emitter out;
             out << YAML::BeginMap;
@@ -207,7 +181,12 @@ private:
                 out << YAML::EndMap;
             };
             out_trans("ref", "custom");
-            out_trans("tracker_random", "tracker_upright");
+            for (int i = 0; i < msg->data; i++) {
+                out_trans(
+                    "tracker_random" + std::to_string(i),
+                    "tracker_upright" + std::to_string(i)
+                );
+            }
             std::ofstream file(file_name, std::ios::out);
             file << out.c_str();
             file.close();
@@ -216,13 +195,13 @@ private:
         }
     }
 
-    void load_yaml(const std_msgs::msg::Empty::SharedPtr msg) {
+    void load_yaml(const std_msgs::msg::Int32::SharedPtr msg) {
         RCLCPP_INFO(this->get_logger(), "Try to load.");
         try {
             using std::string;
             const auto file_name = [&]() {
                 const char* home = std::getenv("HOME");
-                return std::string(home) + "/.teleop/cali.yaml";
+                return std::string(home) + "/.teleop/cali" + to_string(msg->data) + ".yaml";
             }();
             YAML::Node config = YAML::LoadFile(file_name);
             auto in_trans = [&](const string& target_frame, const string& source_frame) {
@@ -249,7 +228,12 @@ private:
                 this->tf_br.sendTransform(transform_stamped);
             };
             in_trans("ref", "custom");
-            in_trans("tracker_random", "tracker_upright");
+            for (int i = 0; i < 2; i++) {
+                in_trans(
+                    "tracker_random" + std::to_string(i),
+                    "tracker_upright" + std::to_string(i)
+                );
+            }
         } catch (tf2::TransformException& ex) {
             RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
         }
@@ -287,18 +271,21 @@ private:
         return translation;
     }
 
-    void record_p0(const std_msgs::msg::Empty::SharedPtr msg) {
+    void record_p0(const std_msgs::msg::Int32::SharedPtr msg) {
         // 同一点的表述 b => 表述 a 的平移量就是 a 表述下 b 的原点位置
-        this->p0 = this->get_position("ref", "tracker_random");
+        // 要求 ref 系下 tracker_random 的原点位置?
+        // 获取 tracker_random 表示转 ref 表示的 R, T: (x_ref = R * (x_trakcer_random) + T)。那么 T 也是要求的原点位置
+        // ref is parent & target; tracker_random is child & source
+        this->p0 = this->get_position("ref", "tracker_random" + std::to_string(msg->data));
         RCLCPP_INFO(this->get_logger(), "p0 has been set to %f %f %f", p0->x(), p0->y(), p0->z());
     }
     // 避免数据竞争
-    void record_px(const std_msgs::msg::Empty::SharedPtr msg) {
-        this->px = this->get_position("ref", "tracker_random");
+    void record_px(const std_msgs::msg::Int32::SharedPtr msg) {
+        this->px = this->get_position("ref", "tracker_random" + std::to_string(msg->data));
         RCLCPP_INFO(this->get_logger(), "px has been set to %f %f %f", px->x(), px->y(), px->z());
     }
-    void record_py(const std_msgs::msg::Empty::SharedPtr msg) {
-        this->py = this->get_position("ref", "tracker_random");
+    void record_py(const std_msgs::msg::Int32::SharedPtr msg) {
+        this->py = this->get_position("ref", "tracker_random" + std::to_string(msg->data));
         RCLCPP_INFO(this->get_logger(), "py has been set to %f %f %f", py->x(), py->y(), py->z());
     }
     void cali_fixed(const std_msgs::msg::Empty::SharedPtr msg) {

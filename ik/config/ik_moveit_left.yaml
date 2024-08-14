@@ -1,37 +1,41 @@
-ik_moveit_vm:
+ik_moveit_left:
   ros__parameters:
-    # [meta]
+    # [vr and hand]
+    vr_idx: 1
+    hand_y_offset: -0.35
     # [control]
     check_joint_broadcaster: false
     fps_moveit_plan: 40.0
     fps_aubo_query: 40.0
     fps_aubo_consume: 200.0
-    latency_hand_to_before_plan: 0.008
-    right_arm: false # 左臂反转 y
+    mirror_the_hand: false # 左臂反转 y
     # there is time to wait for queue!!
-    latency_after_plan_others: 0.008
-    size_expected_mac_points: 12 # should least 50
+    size_expected_mac_points: 11 # should least 50
+    # [precition]
+    enable_pose_filter: false
     pos_filter_q_x: 0.1
     pos_filter_q_v: 100.0
     pos_filter_r_x: 5.0
+    latency_hand_to_before_plan: 0.008
+    latency_after_plan_others: 0.008
     # max vel and max acc
     joints_deg_max_vel: [150.0, 150.0, 150.0, 240.0, 240.0, 240.0]
-    joints_deg_max_acc: [300.0, 300.0, 300.0, 360.0, 360.0, 360.0]
+    joints_deg_max_acc: [150.0, 150.0, 150.0, 180.0, 180.0, 180.0]
+    joints_jump_deg: 40.0
+    joints_jump_limit_rate: 0.03
     # hand min diff for planning
     hand_pos_min_diff_to_plan: 0.005
     hand_deg_min_diff_to_plan: 1.0
     # [ik] kdl, internal
-    ik_method: "kdl"
+    ik_method: "internal"
     # [silent mode]
     mode_no_plan: false
     # [aubo ip]
     aubo_service_port: 8899
-    # [precition]
-    enable_pose_filter: false
 
 
 /**:
   ros__parameters:
     # [meta]
     group_name: "left_dual2"
-    aubo_ip: "192.168.38.128"
+    aubo_ip: "192.168.1.108"

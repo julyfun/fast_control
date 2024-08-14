@@ -31,6 +31,8 @@
 
 namespace ik::moveit {
 
+using std::to_string;
+
 using Points = trajectory_msgs::msg::JointTrajectory::_points_type;
 using geometry_msgs::msg::Pose;
 using ik::PositionFilter;
@@ -57,6 +59,14 @@ using ::moveit::planning_interface::MoveGroupInterface;
 // const double JOINTS_ANGLE_MAX_VEL[6] = { 5.0, 5.0, 5.0, 5.5, 5.5, 5.5 };
 // const double POS_MIN_DIFF_TO_SEND = 0.005;
 // const double ANGLE_MIN_DIFF_TO_SEND = 1.0;
+
+std::string array6_to_string(const std::array<double, 6>& arr) {
+    std::string res;
+    for (size_t i = 0; i < 6; ++i) {
+        res += std::to_string(arr[i] / M_PI * 180.0).substr(0, 7) + " ";
+    }
+    return res;
+}
 
 template<typename T, size_t N>
 std::array<T, N> minus(const std::array<T, N>& a, const std::array<T, N>& b) {
@@ -97,8 +107,11 @@ double closest_angle(const double from, const double target) {
     return target + reduced_angle(from - target);
 }
 
-const double ANGLE_LIMIT[6][2] = { { -360, 360 }, { -175, 175 }, { -175, 175 },
-                                   { -175, 175 }, { -175, 175 }, { -360, 360 } };
+const double CHECK_ANGLE_LIMIT[6][2] = { { -360, 360 }, { -175, 175 }, { -175, 175 },
+                                         { -175, 175 }, { -175, 175 }, { -360, 360 } };
+// 0.5 degree stricter
+const double SENT_ANGLE_LIMIT[6][2] = { { -359.5, 359.5 }, { -174.5, 174.5 }, { -174.5, 174.5 },
+                                        { -174.5, 174.5 }, { -174.5, 174.5 }, { -359.5, 359.5 } };
 
 const double deg2rad(const double deg) {
     return deg / 180.0 * M_PI;
@@ -115,7 +128,8 @@ std::array<double, 6> limited_closest_joint_angles(
     std::array<double, 6> result;
     for (size_t i = 0; i < 6; ++i) {
         result[i] = closest_angle(pre_angles_thats_reduced[i], target_angles[i]);
-        result[i] = std::clamp(result[i], deg2rad(ANGLE_LIMIT[i][0]), deg2rad(ANGLE_LIMIT[i][1]));
+        result[i] =
+            std::clamp(result[i], deg2rad(SENT_ANGLE_LIMIT[i][0]), deg2rad(SENT_ANGLE_LIMIT[i][1]));
     }
     return result;
 }
@@ -156,7 +170,6 @@ private:
     // [control]
     double latency_hand_to_before_plan;
     double latency_after_plan_others;
-    bool right_arm;
     // [plan state]
     std::array<double, 6> last_sent_aubo_point;
     std::array<double, 6> last_sent_aubo_point_vel;
@@ -204,7 +217,10 @@ public:
         tf_buffer(this->get_clock()),
         tf_listener(this->tf_buffer),
         // [moveit]
-        node_for_move_group(std::make_shared<rclcpp::Node>("node_for_move_group")),
+        node_for_move_group(std::make_shared<rclcpp::Node>(
+            "node_for_move_group",
+            rclcpp::NodeOptions().allow_undeclared_parameters(true)
+        )),
         move_group_interface(node_for_move_group, this->group_name),
         joint_model_group([&]() {
             return this->move_group_interface.getRobotModel()->getJointModelGroup(this->group_name);
@@ -226,7 +242,6 @@ public:
                 this->sub_mac_size = msg->data;
             }
         )),
-        right_arm(this->get_parameter("right_arm").as_bool()),
         joint_cmd_pub(this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
             "/" + this->group_name + "_controller/joint_trajectory",
             10
@@ -286,6 +301,31 @@ public:
                     return;
                 }
             }
+        }
+
+        {
+            using namespace std::chrono_literals;
+            auto parameters_client =
+                std::make_shared<rclcpp::SyncParametersClient>(node_for_move_group, "/move_group");
+            while (!parameters_client->wait_for_service(1s)) {
+                if (!rclcpp::ok()) {
+                    RCLCPP_ERROR(
+                        this->node_for_move_group->get_logger(),
+                        "Interrupted while waiting for the service. Exiting."
+                    );
+                    rclcpp::shutdown();
+                }
+                RCLCPP_INFO(
+                    this->node_for_move_group->get_logger(),
+                    "service not available, waiting again..."
+                );
+            }
+            rcl_interfaces::msg::ListParametersResult parameter_list =
+                parameters_client->list_parameters({ "robot_description_kinematics" }, 10);
+            auto parameters = parameters_client->get_parameters(parameter_list.names);
+
+            // set the parameters to our node
+            this->node_for_move_group->set_parameters(parameters);
         }
 
         // [psm]
@@ -522,10 +562,10 @@ private:
             double max;
             double ratio;
         };
-        const auto out_pos = [](const Eigen::Vector3<double>& position,
-                                const Out& outx,
-                                const Out& outy,
-                                const Out& outz) {
+        const auto scaled_pos_fn = [](const Eigen::Vector3<double>& position,
+                                      const Out& outx,
+                                      const Out& outy,
+                                      const Out& outz) {
             return tf2::Vector3(
                 std::clamp(outx.base + position.x() * outx.ratio, outx.min, outx.max),
                 std::clamp(outy.base + position.y() * outy.ratio, outy.min, outy.max),
@@ -535,13 +575,18 @@ private:
 
         const double ratio = 1.0;
         const bool enable_pose_filter = this->get_parameter("enable_pose_filter").as_bool();
-        const auto out_esti_pos = out_pos(
+        const auto scaled_pos = scaled_pos_fn(
             enable_pose_filter ? pos_estimated_effector
                                : Eigen::Vector3<double> { pos.x(), pos.y(), pos.z() },
             { +0.4, -0.7, 0.7, ratio },
             { 0, -1.8, 1.8, ratio },
             { 0.2, 0.15, 1.0, ratio }
         );
+
+        // 左手 hand y = 0.4 时，应该解算 x = 0.0
+        const auto right_left_pos = this->get_parameter("mirror_the_hand").as_bool()
+            ? tf2::Vector3(-scaled_pos.y(), -scaled_pos.x(), scaled_pos.z())
+            : tf2::Vector3(scaled_pos.y(), -scaled_pos.x(), scaled_pos.z());
 
         const auto [this_plan_ancestor_id, from] = [&]() {
             // std::lock_guard<std::mutex> lock(this->last_sent_aubo_point_mutex); // 不需要锁 sent aubo point
@@ -552,9 +597,9 @@ private:
         const auto ori_here = ori;
         const auto to = [&] {
             geometry_msgs::msg::Pose msg;
-            msg.position.x = out_esti_pos[0];
-            msg.position.y = out_esti_pos[1];
-            msg.position.z = out_esti_pos[2];
+            msg.position.x = right_left_pos[0];
+            msg.position.y = right_left_pos[1];
+            msg.position.z = right_left_pos[2];
             msg.orientation = tf2::toMsg(ori_here);
             return msg;
         }();
@@ -631,8 +676,9 @@ private:
 
     bool collide_or_outofrange(const std::array<double, 6>& joint_angles) {
         for (size_t i = 0; i < 6; ++i) {
-            if (joint_angles[i] < deg2rad(ANGLE_LIMIT[i][0])
-                || joint_angles[i] > deg2rad(ANGLE_LIMIT[i][1])) {
+            if (joint_angles[i] < deg2rad(CHECK_ANGLE_LIMIT[i][0])
+                || joint_angles[i] > deg2rad(CHECK_ANGLE_LIMIT[i][1]))
+            {
                 RCLCPP_ERROR(
                     this->get_logger(),
                     "Joint %d out of range: %f",
@@ -693,21 +739,8 @@ private:
             auto pre_sent_point = this->last_sent_aubo_point;
             auto pre_sent_vel = this->last_sent_aubo_point_vel;
 
-            // [v1: always fill]
             int points_needed = this->size_expected_mac_points - points_size;
             RCLCPP_INFO(this->get_logger(), "points_needed: %d", points_needed);
-
-            // [v2]
-            // int points_needed = [&]() {
-            //     if (this->fill_to_avoid_hunger) {
-            //         return this->size_expected_mac_points - points_size;
-            //     }
-            //     if (this->plan_point_queue.empty()) {
-            //         return 0;
-            //     }
-            //     return std::min(this->size_expected_mac_points - points_size, 7);
-            // }();
-            // RCLCPP_INFO(this->get_logger(), "points_needed: %d", points_needed);
 
             // [Try to consume a plan in each loop]
             bool ok_no_collide = true;
@@ -724,6 +757,35 @@ private:
                 // make it close to pre_point
                 const auto nxt_plan_point =
                     limited_closest_joint_angles(this->plan_point_queue.front(), pre_sent_point);
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "nxt_plan_point: %s",
+                    std::accumulate(
+                        nxt_plan_point.begin(),
+                        nxt_plan_point.end(),
+                        std::string(),
+                        [](std::string& a, double b) {
+                            return a + std::to_string(b / M_PI * 180.0).substr(0, 7) + " ";
+                        }
+                    ).c_str()
+                );
+                const double joints_limit_rate = [&]() {
+                    for (size_t i = 0; i < 6; ++i) {
+                        if (std::abs(nxt_plan_point[i] - pre_sent_point[i])
+                            > deg2rad(this->get_parameter("joints_jump_deg").as_double()))
+                        {
+                            RCLCPP_INFO(
+                                this->get_logger(),
+                                "Joint Jump! %d %f %f",
+                                int(i),
+                                rad2deg(nxt_plan_point[i]),
+                                rad2deg(pre_sent_point[i])
+                            );
+                            return this->get_parameter("joints_jump_limit_rate").as_double();
+                        }
+                    }
+                    return 1.0;
+                }();
                 // const auto nxt_plan_vel =
                 //     mul(minus(nxt_plan_point, pre_plan_point), this->fps_aubo_consume);
                 std::array<bool, 6> done;
@@ -740,8 +802,10 @@ private:
                         };
                         for (int i = 0; i < 6; i++) {
                             const double dis = nxt_plan_point[i] - pre_sent_point[i];
+                            // 不要缩减 a_max，会停不下来
                             const double a_max = deg2rad(this->joints_deg_max_acc[i]);
-                            const double v_max = deg2rad(this->joints_deg_max_vel[i]);
+                            const double v_max =
+                                deg2rad(this->joints_deg_max_vel[i]) * joints_limit_rate;
                             const double best_v_at_pre_d =
                                 limited_by(sign(dis) * std::sqrt(std::abs(dis) * a_max), v_max);
                             const double acc_if_goto_best_v =
@@ -767,21 +831,6 @@ private:
                         }
                         return so_point_is;
                     }();
-                    // [print them]
-                    {
-                        std::string a;
-                        for (int i = 0; i < 6; i++) {
-                            a += std::to_string(joints_acc[i] / M_PI * 180.0).substr(0, 7) + " ";
-                        }
-                        std::string v;
-                        for (int i = 0; i < 6; i++) {
-                            v += std::to_string(so_v_is[i] / M_PI * 180.0).substr(0, 7) + " ";
-                        }
-                        std::string x;
-                        for (int i = 0; i < 6; i++) {
-                            x += std::to_string(so_point_is[i] / M_PI * 180.0).substr(0, 7) + " ";
-                        }
-                    }
                     for (int i = 0; i < 6; i++) {
                         if (std::signbit(nxt_plan_point[i] - so_point_is[i])
                                 != std::signbit(nxt_plan_point[i] - pre_sent_point[i])
@@ -791,11 +840,28 @@ private:
                             need_done--;
                         }
                     }
+                    // acc, use array6_to_string
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "joints_acc: %s",
+                        array6_to_string(joints_acc).c_str()
+                    );
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "so_v_is: %s",
+                        array6_to_string(so_v_is).c_str()
+                    );
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "so_point_is: %s",
+                        array6_to_string(so_point_is).c_str()
+                    );
                     if (this->collide_or_outofrange(so_point_is)) {
                         ok_no_collide = false;
                         break;
                     }
                     waypoint_vector.push_back(arr_to_waypoint(so_point_is));
+                    // show sent point
                     points_needed--;
                     pre_sent_point = so_point_is;
                 }
@@ -932,11 +998,16 @@ private:
     }
 
     std::tuple<tf2::Vector3, tf2::Quaternion> get_hand_pose() {
-        const auto transform = this->get_transform("custom", "tracker_upright");
-        const Eigen::Vector3d pos = { transform.getOrigin().x(),
-                                      transform.getOrigin().y(),
-                                      transform.getOrigin().z() };
-        return std::make_tuple(transform.getOrigin(), transform.getRotation());
+        const auto transform = this->get_transform(
+            "custom",
+            "tracker_upright" + to_string(this->get_parameter("vr_idx").as_int())
+        );
+        const tf2::Vector3 pos = { transform.getOrigin().x(),
+                                   transform.getOrigin().y()
+                                       + this->get_parameter("hand_y_offset").as_double(), // 左右手
+                                   transform.getOrigin().z() };
+
+        return std::make_tuple(pos, transform.getRotation());
     }
 
     std::optional<std::array<double, 6>>

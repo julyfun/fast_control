@@ -5,29 +5,29 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    config = os.path.join(
-        get_package_share_directory('ik'), 'config', 'ik_moveit_vm.yaml'
+    left_config = os.path.join(
+        get_package_share_directory('ik'), 'config', 'ik_moveit_left.yaml'
     )
-    ik_moveit_node = Node(
+    ik_moveit_left_node = Node(
         package='ik',
         executable='ik_moveit_exe',
-        name='ik_moveit_vm',
+        name='ik_moveit_left',
         output='screen',
-        parameters=[config]
+        parameters=[left_config]
     )
 
-    config2 = os.path.join(
-        get_package_share_directory('ik'), 'config', 'ik_moveit_real.yaml'
+    right_config = os.path.join(
+        get_package_share_directory('ik'), 'config', 'ik_moveit_right.yaml'
     )
-    ik_moveit_node2 = Node(
+    ik_moveit_right_node = Node(
         package='ik',
         executable='ik_moveit_exe',
-        name='ik_moveit_real',
+        name='ik_moveit_right',
         output='screen',
-        parameters=[config2]
+        parameters=[right_config]
     )
 
     return LaunchDescription([
-        ik_moveit_node,
-        # ik_moveit_node2,
+        ik_moveit_left_node,
+        # ik_moveit_right_node
     ])

@@ -1,5 +1,3 @@
-// #include "tf_test/tf_test.hpp"
-
 // C++ system
 #include <cstdint>
 #include <functional>
@@ -80,23 +78,28 @@ private:
     void handle_client(Poco::Net::StreamSocket& socket) {
         std::vector<float> buffer(12);
         while (rclcpp::ok()) {
-            // 这是等待式的吧
-            size_t bytes_received =
-                socket.receiveBytes(buffer.data(), buffer.size() * sizeof(float));
-            if (bytes_received == buffer.size() * sizeof(float)) {
-                auto transform = m_to_mat(buffer);
-                this->publish_transform(transform);
-            } else {
-                RCLCPP_WARN(this->get_logger(), "Incomplete data received.");
+            // receiveBytes() 函数会等待并阻塞
+            int n; // 设备数量
+            socket.receiveBytes(&n, sizeof(n));
+            RCLCPP_INFO_ONCE(this->get_logger(), "Device count: %d", n);
+            for (int i = 0; i < n; i++) {
+                size_t bytes_received =
+                    socket.receiveBytes(buffer.data(), buffer.size() * sizeof(float));
+                if (bytes_received == buffer.size() * sizeof(float)) {
+                    auto transform = m_to_mat(buffer);
+                    this->publish_transform(transform, i);
+                } else {
+                    RCLCPP_WARN(this->get_logger(), "Incomplete data received.");
+                }
             }
         }
     }
 
-    void publish_transform(const tf2::Transform& transform) {
+    void publish_transform(const tf2::Transform& transform, int idx) {
         geometry_msgs::msg::TransformStamped transform_stamped;
         transform_stamped.header.stamp = this->now();
         transform_stamped.header.frame_id = "ref";
-        transform_stamped.child_frame_id = "tracker_random";
+        transform_stamped.child_frame_id = "tracker_random" + std::to_string(idx);
         const tf2::Quaternion quaternion = transform.getRotation();
         const tf2::Vector3 translation_vector = transform.getOrigin();
         transform_stamped.transform.translation = tf2::toMsg(translation_vector);
