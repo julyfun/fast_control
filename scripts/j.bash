@@ -35,4 +35,6 @@ function j.l {
 function j.pct {
     ros2 topic pub -1 /ik/pct std_msgs/msg/Empty "{}"
 }
-
+function j.pq {
+    ros2 topic pub -1 /ik/pq$1 std_msgs/msg/String "{data: $2}"
+}

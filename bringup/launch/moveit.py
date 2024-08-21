@@ -29,5 +29,5 @@ def generate_launch_description():
 
     return LaunchDescription([
         ik_moveit_left_node,
-        # ik_moveit_right_node
+        ik_moveit_right_node
     ])

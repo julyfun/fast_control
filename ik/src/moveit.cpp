@@ -22,6 +22,7 @@
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/int16.hpp>
 #include <sys/types.h>
+#include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <trajectory_msgs/msg/detail/joint_trajectory__struct.hpp>
 #include <trajectory_msgs/msg/detail/joint_trajectory_point__struct.hpp>
@@ -31,7 +32,12 @@
 
 namespace ik::moveit {
 
+using std::deque;
+using std::mutex;
+using std::string;
 using std::to_string;
+using std::tuple;
+using std::vector;
 
 using Points = trajectory_msgs::msg::JointTrajectory::_points_type;
 using geometry_msgs::msg::Pose;
@@ -59,6 +65,14 @@ using ::moveit::planning_interface::MoveGroupInterface;
 // const double JOINTS_ANGLE_MAX_VEL[6] = { 5.0, 5.0, 5.0, 5.5, 5.5, 5.5 };
 // const double POS_MIN_DIFF_TO_SEND = 0.005;
 // const double ANGLE_MIN_DIFF_TO_SEND = 1.0;
+
+std::string vecd_to_string(const vector<double>& vec) {
+    std::string res;
+    for (const auto& v: vec) {
+        res += std::to_string(v) + " ";
+    }
+    return res;
+}
 
 std::string array6_to_string(const std::array<double, 6>& arr) {
     std::string res;
@@ -105,6 +119,10 @@ double angle_interpolation(const double left, const double right, const int itpl
 
 double closest_angle(const double from, const double target) {
     return target + reduced_angle(from - target);
+}
+
+double real_mod(const double x, const double d) {
+    return x - std::floor(x / d) * d;
 }
 
 const double CHECK_ANGLE_LIMIT[6][2] = { { -360, 360 }, { -175, 175 }, { -175, 175 },
@@ -203,9 +221,16 @@ private:
     std::deque<double> canbus_timeq;
     std::mutex canbus_timeq_mutex;
     // [always-sent-start mode] don't plan
-    bool mode_no_plan;
     // [joint cmd test]
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr joint_cmd_pub;
+    // [plan mode.linear]
+    double begin_time;
+    // [member: points]
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr print_debugq_sub;
+    std::mutex debug_vr_pose_mutex;
+    std::deque<std::vector<double>> debug_vr_poses;
+    std::mutex debug_sent_fk_mutex;
+    deque<aubo_robot_namespace::wayPoint_S> debug_sent_fk;
 
 public:
     explicit Ik(const rclcpp::NodeOptions& options):
@@ -270,9 +295,9 @@ public:
         // [constants]
         this->fps_aubo_consume = this->get_parameter("fps_aubo_consume").as_double();
         this->latency_hand_to_before_plan =
-            this->get_parameter("latency_hand_to_before_plan").as_double();
+            this->get_parameter("latency.hand_to_before_plan").as_double();
         this->latency_after_plan_others =
-            this->get_parameter("latency_after_plan_others").as_double();
+            this->get_parameter("latency.after_plan_others").as_double();
         this->size_expected_mac_points = this->get_parameter("size_expected_mac_points").as_int();
         this->check_joint_broadcaster = this->get_parameter("check_joint_broadcaster").as_bool();
         this->joints_deg_max_vel = [&]() {
@@ -289,7 +314,6 @@ public:
             this->get_parameter("hand_pos_min_diff_to_plan").as_double();
         this->hand_deg_min_diff_to_plan =
             this->get_parameter("hand_deg_min_diff_to_plan").as_double();
-        this->mode_no_plan = this->get_parameter("mode_no_plan").as_bool();
 
         // [check topic]
         {
@@ -503,9 +527,9 @@ public:
             //       std::make_tuple(Eigen::Matrix<double, 2, 1> { pos.z(), 0.0 }, ts_estimated_hand) }
             // );
 
-            this->q_x = this->get_parameter("pos_filter_q_x").as_double();
-            this->q_v = this->get_parameter("pos_filter_q_v").as_double();
-            this->r_x = this->get_parameter("pos_filter_r_x").as_double();
+            this->q_x = this->get_parameter("pos_filter.q.x").as_double();
+            this->q_v = this->get_parameter("pos_filter.q.v").as_double();
+            this->r_x = this->get_parameter("pos_filter.r.x").as_double();
         }
 
         {
@@ -520,7 +544,13 @@ public:
                 10,
                 [this](std_msgs::msg::Empty::SharedPtr msg) { this->print_that(msg); }
             );
+            this->print_debugq_sub = this->create_subscription<std_msgs::msg::String>(
+                "/ik/pq" + to_string(this->get_parameter("vr_idx").as_int()),
+                10,
+                [this](std_msgs::msg::String::SharedPtr msg) { this->sub_print_one_q(msg); }
+            );
         }
+        this->begin_time = this->now().seconds();
     }
 
 private:
@@ -535,8 +565,55 @@ private:
         file << res;
         file.close();
     }
+    void print_one_q(mutex& mut, deque<vector<double>>& q, string filename) {
+        std::lock_guard<std::mutex> lock(mut);
+        std::string res;
+        for (const auto& v: q) {
+            res += vecd_to_string(v) + "\n";
+        }
+        std::ofstream file(string(std::getenv("HOME")) + "/.teleop/" + filename, std::ios::out);
+        file << res;
+        file.close();
+    }
+    void sub_print_one_q(std_msgs::msg::String::SharedPtr qname) {
+        if (qname->data == "vr") {
+            this->print_one_q(
+                this->debug_vr_pose_mutex,
+                this->debug_vr_poses,
+                this->get_parameter("record_vr_file").as_string()
+            );
+        } else if (qname->data == "fk") {
+            deque<vector<double>> fkq;
+            {
+                std::lock_guard lock(this->debug_sent_fk_mutex);
+                for (const auto& wp: this->debug_sent_fk) {
+                    vector<double> fk;
+                    aubo_robot_namespace::wayPoint_S wp_fk;
+                    this->robot_service.robotServiceRobotFk(wp.jointpos, 6, wp_fk);
+                    fk.push_back(wp_fk.cartPos.position.x);
+                    fk.push_back(wp_fk.cartPos.position.y);
+                    fk.push_back(wp_fk.cartPos.position.z);
+                    fk.push_back(wp_fk.orientation.x);
+                    fk.push_back(wp_fk.orientation.y);
+                    fk.push_back(wp_fk.orientation.z);
+                    fk.push_back(wp_fk.orientation.w);
+                    fkq.push_back(fk);
+                }
+            }
+            this->print_one_q(this->debug_sent_fk_mutex, fkq, "fk.txt");
+        }
+    }
+
     void callback_ik() {
-        if (this->mode_no_plan) {
+        if (this->get_parameter("plan_mode").as_string() == "no") {
+            return;
+        }
+        if (this->get_parameter("plan_mode").as_string() == "init_point") {
+            std::lock_guard<std::mutex> lock(this->plan_points_mutex);
+            while (!this->plan_point_queue.empty()) {
+                this->plan_point_queue.pop_front();
+            }
+            this->plan_point_queue.push_back(this->last_sent_aubo_point);
             return;
         }
 
@@ -553,8 +630,9 @@ private:
         const auto points_size = this->get_esti_limited_point_size();
         const double ts_estimated_effector_arraival = ts_before_plan
             + double(points_size) / this->fps_aubo_consume + this->latency_after_plan_others;
-        const auto pos_estimated_effector =
+        const auto pos_predicted_when_effector_arrives =
             this->hand_pos_filter.predict_pos(ts_estimated_effector_arraival);
+        const auto pos_no_predict = this->hand_pos_filter.predict_pos(ts_estimated_hand);
 
         struct Out {
             double base;
@@ -574,10 +652,35 @@ private:
         };
 
         const double ratio = 1.0;
-        const bool enable_pose_filter = this->get_parameter("enable_pose_filter").as_bool();
+        const auto so_you_want = [&]() {
+            if (!this->get_parameter("pos_filter.enabled").as_bool()) {
+                return Eigen::Vector3d { pos.x(), pos.y(), pos.z() };
+            }
+            if (this->get_parameter("pos_filter.prediction").as_bool()) {
+                return pos_predicted_when_effector_arrives;
+            }
+            return pos_no_predict;
+        }();
+
+        {
+            std::lock_guard lock(this->debug_vr_pose_mutex);
+            if (this->debug_vr_poses.size()
+                >= this->get_parameter("launchtime_debug_queue_size").as_int()) {
+                this->debug_vr_poses.pop_front();
+            }
+            std::vector<double> pose;
+            pose.push_back(so_you_want.x());
+            pose.push_back(so_you_want.y());
+            pose.push_back(so_you_want.z());
+            pose.push_back(ori.x());
+            pose.push_back(ori.y());
+            pose.push_back(ori.z());
+            pose.push_back(ori.w());
+            this->debug_vr_poses.push_back(pose);
+        }
+
         const auto scaled_pos = scaled_pos_fn(
-            enable_pose_filter ? pos_estimated_effector
-                               : Eigen::Vector3<double> { pos.x(), pos.y(), pos.z() },
+            so_you_want,
             { +0.4, -0.7, 0.7, ratio },
             { 0, -1.8, 1.8, ratio },
             { 0.2, 0.15, 1.0, ratio }
@@ -596,11 +699,34 @@ private:
         }();
         const auto ori_here = ori;
         const auto to = [&] {
+            if (this->get_parameter("plan_mode").as_string() == "linear") {
+                const double half_t = this->get_parameter("plan_mode_linear.half_t").as_double();
+                // [0 ~ 2.0]
+                const double prop1 =
+                    real_mod(this->now().seconds() - this->begin_time, 2 * half_t) / half_t;
+                const double prop2 = std::min(prop1, 2.0 - prop1);
+                auto param_vec = [this](const string& name) {
+                    const auto vec = this->get_parameter(name).as_double_array();
+                    assert(vec.size() == 3);
+                    return Eigen::Vector3d(vec[0], vec[1], vec[2]);
+                };
+                const auto a = param_vec("plan_mode_linear.A");
+                const auto b = param_vec("plan_mode_linear.B");
+                const auto c = a + (b - a) * prop2;
+                geometry_msgs::msg::Pose msg;
+                msg.position.x = c[0];
+                msg.position.y = c[1];
+                msg.position.z = c[2];
+                msg.orientation = tf2::toMsg(tf2::Quaternion(0.0, 0.0, 0.0, 1.0));
+                return msg;
+            }
             geometry_msgs::msg::Pose msg;
             msg.position.x = right_left_pos[0];
             msg.position.y = right_left_pos[1];
             msg.position.z = right_left_pos[2];
-            msg.orientation = tf2::toMsg(ori_here);
+            msg.orientation = this->get_parameter("plan_mode_normal.q_up").as_bool()
+                ? tf2::toMsg(tf2::Quaternion(0.0, 0.0, 0.0, 1.0))
+                : tf2::toMsg(ori_here);
             return msg;
         }();
 
@@ -802,14 +928,25 @@ private:
                         };
                         for (int i = 0; i < 6; i++) {
                             const double dis = nxt_plan_point[i] - pre_sent_point[i];
-                            // 不要缩减 a_max，会停不下来
+                            const double dis_at_next_control_if_same_v = nxt_plan_point[i]
+                                + pre_sent_vel[i] / this->fps_aubo_consume - pre_sent_point[i];
+                            const double half_dis = (dis + dis_at_next_control_if_same_v) / 2.0;
+                            // 因突变 限制速度时，不要缩减 a_max，会停不下来
                             const double a_max = deg2rad(this->joints_deg_max_acc[i]);
                             const double v_max =
                                 deg2rad(this->joints_deg_max_vel[i]) * joints_limit_rate;
-                            const double best_v_at_pre_d =
-                                limited_by(sign(dis) * std::sqrt(std::abs(dis) * a_max), v_max);
+                            const double best_v_at_half_dis = limited_by(
+                                sign(half_dis) * std::sqrt(std::abs(half_dis) * a_max),
+                                v_max
+                            );
+                            // 有可能 halfdis 和 dis 直接反了
+                            // this is target_v
+                            const double no_inverse_v =
+                                std::signbit(best_v_at_half_dis) != std::signbit(dis)
+                                ? (dis * this->fps_aubo_consume)
+                                : best_v_at_half_dis;
                             const double acc_if_goto_best_v =
-                                (best_v_at_pre_d - pre_sent_vel[i]) * this->fps_aubo_consume;
+                                (no_inverse_v - pre_sent_vel[i]) * this->fps_aubo_consume;
                             const double limited_acc = limited_by(acc_if_goto_best_v, a_max);
                             joints_acc[i] = limited_acc;
                         }
@@ -831,11 +968,11 @@ private:
                         }
                         return so_point_is;
                     }();
+                    const double control_deg_eps =
+                        this->get_parameter("control_deg_eps").as_double();
                     for (int i = 0; i < 6; i++) {
-                        if (std::signbit(nxt_plan_point[i] - so_point_is[i])
-                                != std::signbit(nxt_plan_point[i] - pre_sent_point[i])
-                            && !done[i])
-                        {
+                        if (std::abs(so_point_is[i] - nxt_plan_point[i]) < deg2rad(control_deg_eps)
+                            && !done[i]) {
                             done[i] = true;
                             need_done--;
                         }
@@ -881,6 +1018,16 @@ private:
             const auto now = this->now().seconds();
 
             this->robot_service.robotServiceSetRobotPosData2Canbus(waypoint_vector);
+            {
+                std::lock_guard lock(this->debug_sent_fk_mutex);
+                if (this->debug_sent_fk.size()
+                    >= this->get_parameter("launchtime_debug_queue_size").as_int()) {
+                    this->debug_sent_fk.pop_front();
+                }
+                for (const auto& s: waypoint_vector) {
+                    this->debug_sent_fk.push_back(s);
+                }
+            }
 
             const auto p = this->now().seconds() - now;
 
@@ -910,7 +1057,7 @@ private:
             // }
 
             {
-                // [only for test]
+                // [publish joint states to moveit2 (for collision detecting)]
                 trajectory_msgs::msg::JointTrajectory traj_msg;
                 traj_msg.joint_names = this->joint_model_group->getVariableNames();
                 trajectory_msgs::msg::JointTrajectoryPoint point;
