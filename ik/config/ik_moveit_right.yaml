@@ -13,7 +13,7 @@ ik_moveit_right:
     size_expected_mac_points: 7 # should least 50
     # [precition]
     pos_filter:
-      enabled: true
+      enabled: false
       prediction: false
       q:
         x: 0.1
@@ -25,8 +25,9 @@ ik_moveit_right:
       after_plan_others: 0.048
     # max vel and max acc
     joints_deg_max_vel: [150.0, 150.0, 150.0, 240.0, 240.0, 240.0]
-    joints_deg_max_acc: [200.0, 200.0, 200.0, 250.0, 250.0, 250.0]
-    # joints_deg_max_acc: [200000.0, 200000.0, 200000.0, 250000.0, 250000.0, 250000.0]
+    joints_deg_max_acc: [200.0, 200.0, 200.0, 200.0, 200.0, 200.0]
+    # 每帧 1 / 200s 最多变化 50 ?
+    joints_deg_max_jerk: [40000.0, 40000.0, 40000.0, 40000.0, 40000.0, 40000.0]
     joints_jump_deg: 40.0
     joints_jump_limit_rate: 0.03
     control_deg_eps: 0.001
@@ -36,21 +37,19 @@ ik_moveit_right:
     # [ik] kdl, internal
     ik_method: "internal"
     # [plan mode]
-    # no, init_point, normal, linear
-    plan_mode: "normal" 
+    # no, init_point, normal, linear, sin
+    plan_mode: "sin" 
     # [plan mode.linear]
     plan_mode_linear:
       A: [0.4, -0.4, 0.3]
       B: [0.4, +0.2, 0.3]
-      half_t: 5.0
+      half_t: 2.0
     # [plan mode.normal]
     plan_mode_normal:
       q_up: true
     launchtime_debug_queue_size: 5000
     # [aubo ip]
     aubo_service_port: 8899
-    # [record]
-    record_vr_file: "vr0.txt"
 
 
 /**:

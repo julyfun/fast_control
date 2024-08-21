@@ -32,6 +32,7 @@
 
 namespace ik::moveit {
 
+using std::array;
 using std::deque;
 using std::mutex;
 using std::string;
@@ -80,6 +81,16 @@ std::string array6_to_string(const std::array<double, 6>& arr) {
         res += std::to_string(arr[i] / M_PI * 180.0).substr(0, 7) + " ";
     }
     return res;
+}
+
+// add
+template<typename T, size_t N>
+std::array<T, N> add(const std::array<T, N>& a, const std::array<T, N>& b) {
+    std::array<T, N> result;
+    for (size_t i = 0; i < N; ++i) {
+        result[i] = a[i] + b[i];
+    }
+    return result;
 }
 
 template<typename T, size_t N>
@@ -191,8 +202,8 @@ private:
     // [plan state]
     std::array<double, 6> last_sent_aubo_point;
     std::array<double, 6> last_sent_aubo_point_vel;
+    std::array<double, 6> last_sent_aubo_point_acc;
     uint64_t last_sent_aubo_point_id;
-    // std::mutex last_sent_aubo_point_mutex;
     // [plan points]
     std::deque<std::array<double, 6>> plan_point_queue;
     uint64_t in_plan_points_ancestor_id;
@@ -213,13 +224,10 @@ private:
     // [joints max vel and max acc]
     std::array<double, 6> joints_deg_max_vel;
     std::array<double, 6> joints_deg_max_acc;
+    std::array<double, 6> joints_deg_max_jerk;
     // [hand]
     double hand_pos_min_diff_to_plan;
     double hand_deg_min_diff_to_plan;
-    // [透传时间监视]
-    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr print_canbus_sub;
-    std::deque<double> canbus_timeq;
-    std::mutex canbus_timeq_mutex;
     // [always-sent-start mode] don't plan
     // [joint cmd test]
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr joint_cmd_pub;
@@ -227,10 +235,12 @@ private:
     double begin_time;
     // [member: points]
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr print_debugq_sub;
+
     std::mutex debug_vr_pose_mutex;
     std::deque<std::vector<double>> debug_vr_poses;
-    std::mutex debug_sent_fk_mutex;
-    deque<aubo_robot_namespace::wayPoint_S> debug_sent_fk;
+
+    std::mutex debug_sent_wayp_mutex;
+    deque<aubo_robot_namespace::wayPoint_S> debug_sent_wayp;
 
 public:
     explicit Ik(const rclcpp::NodeOptions& options):
@@ -307,6 +317,11 @@ public:
         }();
         this->joints_deg_max_acc = [&]() {
             const auto param = this->get_parameter("joints_deg_max_acc").as_double_array();
+            return std::array<double, 6> { param[0], param[1], param[2],
+                                           param[3], param[4], param[5] };
+        }();
+        this->joints_deg_max_jerk = [&]() {
+            const auto param = this->get_parameter("joints_deg_max_jerk").as_double_array();
             return std::array<double, 6> { param[0], param[1], param[2],
                                            param[3], param[4], param[5] };
         }();
@@ -412,6 +427,7 @@ public:
                 for (size_t i = 0; i < 6; ++i) {
                     this->last_sent_aubo_point[i] = joint_status[i].jointPosJ; // ok this
                     this->last_sent_aubo_point_vel[i] = 0.0;
+                    this->last_sent_aubo_point_acc[i] = 0.0;
                     init_joints +=
                         std::to_string(this->last_sent_aubo_point[i] / M_PI * 180.0) + " ";
                 }
@@ -539,11 +555,6 @@ public:
         }
 
         {
-            this->print_canbus_sub = this->create_subscription<std_msgs::msg::Empty>(
-                "/ik/pct",
-                10,
-                [this](std_msgs::msg::Empty::SharedPtr msg) { this->print_that(msg); }
-            );
             this->print_debugq_sub = this->create_subscription<std_msgs::msg::String>(
                 "/ik/pq" + to_string(this->get_parameter("vr_idx").as_int()),
                 10,
@@ -554,53 +565,64 @@ public:
     }
 
 private:
-    void print_that(std_msgs::msg::Empty::SharedPtr) {
-        this->canbus_timeq_mutex.lock();
-        std::string res;
-        for (const auto& time: this->canbus_timeq) {
-            res += std::to_string(time * 1000) + " ";
-        }
-        this->canbus_timeq_mutex.unlock();
-        std::ofstream file(std::string(std::getenv("HOME")) + "/.teleop/data.txt", std::ios::out);
-        file << res;
-        file.close();
-    }
-    void print_one_q(mutex& mut, deque<vector<double>>& q, string filename) {
+    void print_one_q(mutex& mut, deque<vector<double>>& q, string qname) {
         std::lock_guard<std::mutex> lock(mut);
         std::string res;
         for (const auto& v: q) {
             res += vecd_to_string(v) + "\n";
         }
-        std::ofstream file(string(std::getenv("HOME")) + "/.teleop/" + filename, std::ios::out);
+        std::ofstream file(
+            string(std::getenv("HOME")) + "/.teleop/" + qname
+                + to_string(this->get_parameter("vr_idx").as_int()) + ".txt",
+            std::ios::out
+        );
         file << res;
         file.close();
     }
+
+    template<typename T>
+    void debug_insert_one_q(mutex& mut, deque<T>& q, const T& v) {
+        std::lock_guard<std::mutex> lock(mut);
+        if (q.size() >= this->get_parameter("launchtime_debug_queue_size").as_int()) {
+            q.pop_front();
+        }
+        q.push_back(v);
+    }
+
     void sub_print_one_q(std_msgs::msg::String::SharedPtr qname) {
         if (qname->data == "vr") {
-            this->print_one_q(
-                this->debug_vr_pose_mutex,
-                this->debug_vr_poses,
-                this->get_parameter("record_vr_file").as_string()
-            );
+            this->print_one_q(this->debug_vr_pose_mutex, this->debug_vr_poses, qname->data);
         } else if (qname->data == "fk") {
             deque<vector<double>> fkq;
             {
-                std::lock_guard lock(this->debug_sent_fk_mutex);
-                for (const auto& wp: this->debug_sent_fk) {
-                    vector<double> fk;
+                std::lock_guard lock(this->debug_sent_wayp_mutex);
+                for (const auto& wp: this->debug_sent_wayp) {
                     aubo_robot_namespace::wayPoint_S wp_fk;
                     this->robot_service.robotServiceRobotFk(wp.jointpos, 6, wp_fk);
-                    fk.push_back(wp_fk.cartPos.position.x);
-                    fk.push_back(wp_fk.cartPos.position.y);
-                    fk.push_back(wp_fk.cartPos.position.z);
-                    fk.push_back(wp_fk.orientation.x);
-                    fk.push_back(wp_fk.orientation.y);
-                    fk.push_back(wp_fk.orientation.z);
-                    fk.push_back(wp_fk.orientation.w);
-                    fkq.push_back(fk);
+                    fkq.push_back({ wp_fk.cartPos.position.x,
+                                    wp_fk.cartPos.position.y,
+                                    wp_fk.cartPos.position.z,
+                                    wp_fk.orientation.x,
+                                    wp_fk.orientation.y,
+                                    wp_fk.orientation.z,
+                                    wp_fk.orientation.w });
                 }
             }
-            this->print_one_q(this->debug_sent_fk_mutex, fkq, "fk.txt");
+            this->print_one_q(this->debug_sent_wayp_mutex, fkq, qname->data);
+        } else if (qname->data == "way") {
+            deque<vector<double>> wayq;
+            {
+                std::lock_guard lock(this->debug_sent_wayp_mutex);
+                for (const auto& wp: this->debug_sent_wayp) {
+                    wayq.push_back({ wp.jointpos[0],
+                                     wp.jointpos[1],
+                                     wp.jointpos[2],
+                                     wp.jointpos[3],
+                                     wp.jointpos[4],
+                                     wp.jointpos[5] });
+                }
+            }
+            this->print_one_q(this->debug_sent_wayp_mutex, wayq, qname->data);
         }
     }
 
@@ -662,22 +684,17 @@ private:
             return pos_no_predict;
         }();
 
-        {
-            std::lock_guard lock(this->debug_vr_pose_mutex);
-            if (this->debug_vr_poses.size()
-                >= this->get_parameter("launchtime_debug_queue_size").as_int()) {
-                this->debug_vr_poses.pop_front();
-            }
-            std::vector<double> pose;
-            pose.push_back(so_you_want.x());
-            pose.push_back(so_you_want.y());
-            pose.push_back(so_you_want.z());
-            pose.push_back(ori.x());
-            pose.push_back(ori.y());
-            pose.push_back(ori.z());
-            pose.push_back(ori.w());
-            this->debug_vr_poses.push_back(pose);
-        }
+        this->debug_insert_one_q(
+            this->debug_vr_pose_mutex,
+            this->debug_vr_poses,
+            { so_you_want.x(),
+              so_you_want.y(),
+              so_you_want.z(),
+              ori.x(),
+              ori.y(),
+              ori.z(),
+              ori.w() }
+        );
 
         const auto scaled_pos = scaled_pos_fn(
             so_you_want,
@@ -713,6 +730,25 @@ private:
                 const auto a = param_vec("plan_mode_linear.A");
                 const auto b = param_vec("plan_mode_linear.B");
                 const auto c = a + (b - a) * prop2;
+                geometry_msgs::msg::Pose msg;
+                msg.position.x = c[0];
+                msg.position.y = c[1];
+                msg.position.z = c[2];
+                msg.orientation = tf2::toMsg(tf2::Quaternion(0.0, 0.0, 0.0, 1.0));
+                return msg;
+            }
+            if (this->get_parameter("plan_mode").as_string() == "sin") {
+                const double t = this->get_parameter("plan_mode_linear.half_t").as_double() * 2.0;
+                const double y = std::sin(2 * M_PI * this->now().seconds() / t);
+                const double prop = (y + 1.0) / 2.0;
+                auto param_vec = [this](const string& name) {
+                    const auto vec = this->get_parameter(name).as_double_array();
+                    assert(vec.size() == 3);
+                    return Eigen::Vector3d(vec[0], vec[1], vec[2]);
+                };
+                const auto a = param_vec("plan_mode_linear.A");
+                const auto b = param_vec("plan_mode_linear.B");
+                const auto c = a + (b - a) * prop;
                 geometry_msgs::msg::Pose msg;
                 msg.position.x = c[0];
                 msg.position.y = c[1];
@@ -850,7 +886,7 @@ private:
         //     std::memcpy(arr.data(), waypoint.jointpos, 6 * sizeof(double));
         //     return arr;
         // };
-        const auto [waypoint_vector, pre_sent_point, pre_sent_vel] = [&]() {
+        const auto [waypoint_vector, pre_sent_point, pre_sent_vel, pre_sent_acc] = [&]() {
             // 这里要锁住，plan 线程会修改相关变量
             std::lock_guard<std::mutex> lock_plan(this->plan_points_mutex);
             // [这里之前用的 moveit plan，规划起点必须是上一个规划终点。现在换成直接 ik 了以后就没这必要了]
@@ -864,6 +900,7 @@ private:
             // std::lock_guard<std::mutex> lock_sent(this->last_sent_aubo_point_mutex);
             auto pre_sent_point = this->last_sent_aubo_point;
             auto pre_sent_vel = this->last_sent_aubo_point_vel;
+            auto pre_sent_acc = this->last_sent_aubo_point_acc;
 
             int points_needed = this->size_expected_mac_points - points_size;
             RCLCPP_INFO(this->get_logger(), "points_needed: %d", points_needed);
@@ -920,54 +957,74 @@ private:
 
                 // [generate a sent point]
                 while (ok_no_collide && points_needed > 0 && need_done > 0) {
-                    const std::array<double, 6> joints_acc = [&]() {
-                        std::array<double, 6> joints_acc = {};
+                    const std::array<double, 6> joints_jerk = [&]() {
+                        std::array<double, 6> joints_jerk = {};
                         auto sign = [](const double some) { return some > 0 ? 1 : -1; };
                         auto limited_by = [](const double some, const double abs_lim) {
                             return std::clamp(some, -abs_lim, abs_lim);
                         };
                         for (int i = 0; i < 6; i++) {
-                            const double dis = nxt_plan_point[i] - pre_sent_point[i];
-                            const double dis_at_next_control_if_same_v = nxt_plan_point[i]
-                                + pre_sent_vel[i] / this->fps_aubo_consume - pre_sent_point[i];
-                            const double half_dis = (dis + dis_at_next_control_if_same_v) / 2.0;
                             // 因突变 限制速度时，不要缩减 a_max，会停不下来
+                            const double j_max = deg2rad(this->joints_deg_max_jerk[i]);
                             const double a_max = deg2rad(this->joints_deg_max_acc[i]);
                             const double v_max =
                                 deg2rad(this->joints_deg_max_vel[i]) * joints_limit_rate;
-                            const double best_v_at_half_dis = limited_by(
-                                sign(half_dis) * std::sqrt(std::abs(half_dis) * a_max),
-                                v_max
+
+                            auto online_itpltn_best_dxdt = [&limited_by, &sign](
+                                                               const double pre_x,
+                                                               const double nxt_x,
+                                                               const double pre_dxdt,
+                                                               const double fps,
+                                                               const double dxdt_max,
+                                                               const double dxdtdt_max
+                                                           ) {
+                                const double dis = nxt_x - pre_x;
+                                const double dis_at_next_control_if_same_v =
+                                    nxt_x - (pre_dxdt / fps + pre_x);
+                                const double half_dis = (dis + dis_at_next_control_if_same_v) / 2.0;
+                                const double best_dxdt_at_half_dis = limited_by(
+                                    sign(half_dis) * std::sqrt(std::abs(half_dis) * dxdtdt_max),
+                                    dxdt_max
+                                );
+                                const double no_inverse_dxdt =
+                                    std::signbit(best_dxdt_at_half_dis) != std::signbit(dis)
+                                    ? (dis * fps)
+                                    : best_dxdt_at_half_dis;
+                                return no_inverse_dxdt;
+                            };
+                            const double best_v = online_itpltn_best_dxdt(
+                                pre_sent_point[i],
+                                nxt_plan_point[i],
+                                pre_sent_vel[i],
+                                this->fps_aubo_consume,
+                                v_max,
+                                a_max
                             );
-                            // 有可能 halfdis 和 dis 直接反了
-                            // this is target_v
-                            const double no_inverse_v =
-                                std::signbit(best_v_at_half_dis) != std::signbit(dis)
-                                ? (dis * this->fps_aubo_consume)
-                                : best_v_at_half_dis;
-                            const double acc_if_goto_best_v =
-                                (no_inverse_v - pre_sent_vel[i]) * this->fps_aubo_consume;
-                            const double limited_acc = limited_by(acc_if_goto_best_v, a_max);
-                            joints_acc[i] = limited_acc;
+                            // const double best_acc = online_itpltn_best_dxdt(
+                            //     pre_sent_vel[i],
+                            //     best_v,
+                            //     pre_sent_acc[i],
+                            //     this->fps_aubo_consume,
+                            //     a_max,
+                            //     j_max
+                            // );
+                            const double best_acc = limited_by(
+                                (best_v - pre_sent_vel[i]) * this->fps_aubo_consume,
+                                a_max
+                            );
+                            const double jerk_if_goto_best_acc =
+                                (best_acc - pre_sent_acc[i]) * this->fps_aubo_consume;
+                            const double best_jerk = limited_by(jerk_if_goto_best_acc, j_max);
+                            joints_jerk[i] = best_jerk;
                         }
-                        return joints_acc;
+                        return joints_jerk;
                     }();
-                    const std::array<double, 6> so_v_is = [&]() {
-                        std::array<double, 6> so_v_is = {};
-                        for (int i = 0; i < 6; i++) {
-                            so_v_is[i] = pre_sent_vel[i] + joints_acc[i] / this->fps_aubo_consume;
-                        }
-                        return so_v_is;
-                    }();
-                    pre_sent_vel = so_v_is;
-                    const std::array<double, 6> so_point_is = [&]() {
-                        std::array<double, 6> so_point_is = {};
-                        for (int i = 0; i < 6; i++) {
-                            so_point_is[i] =
-                                pre_sent_point[i] + so_v_is[i] / this->fps_aubo_consume;
-                        }
-                        return so_point_is;
-                    }();
+                    const auto so_acc_is =
+                        add(pre_sent_acc, mul(joints_jerk, 1.0 / this->fps_aubo_consume));
+                    const auto so_v_is =
+                        add(pre_sent_vel, mul(so_acc_is, 1.0 / this->fps_aubo_consume));
+                    const auto so_point_is =
+                        add(pre_sent_point, mul(so_v_is, 1.0 / this->fps_aubo_consume));
                     const double control_deg_eps =
                         this->get_parameter("control_deg_eps").as_double();
                     for (int i = 0; i < 6; i++) {
@@ -977,11 +1034,15 @@ private:
                             need_done--;
                         }
                     }
-                    // acc, use array6_to_string
+                    RCLCPP_INFO(
+                        this->get_logger(),
+                        "joints_jerk: %s",
+                        array6_to_string(joints_jerk).c_str()
+                    );
                     RCLCPP_INFO(
                         this->get_logger(),
                         "joints_acc: %s",
-                        array6_to_string(joints_acc).c_str()
+                        array6_to_string(so_acc_is).c_str()
                     );
                     RCLCPP_INFO(
                         this->get_logger(),
@@ -993,6 +1054,7 @@ private:
                         "so_point_is: %s",
                         array6_to_string(so_point_is).c_str()
                     );
+                    // don't add to queue
                     if (this->collide_or_outofrange(so_point_is)) {
                         ok_no_collide = false;
                         break;
@@ -1000,13 +1062,16 @@ private:
                     waypoint_vector.push_back(arr_to_waypoint(so_point_is));
                     // show sent point
                     points_needed--;
+
+                    pre_sent_acc = so_acc_is;
+                    pre_sent_vel = so_v_is;
                     pre_sent_point = so_point_is;
                 }
                 if (need_done == 0) {
                     this->plan_point_queue.pop_front();
                 }
             }
-            return std::make_tuple(waypoint_vector, pre_sent_point, pre_sent_vel);
+            return std::make_tuple(waypoint_vector, pre_sent_point, pre_sent_vel, pre_sent_acc);
         }();
         if (waypoint_vector.empty()) {
             RCLCPP_INFO(this->get_logger(), "no points to send");
@@ -1018,30 +1083,18 @@ private:
             const auto now = this->now().seconds();
 
             this->robot_service.robotServiceSetRobotPosData2Canbus(waypoint_vector);
-            {
-                std::lock_guard lock(this->debug_sent_fk_mutex);
-                if (this->debug_sent_fk.size()
-                    >= this->get_parameter("launchtime_debug_queue_size").as_int()) {
-                    this->debug_sent_fk.pop_front();
-                }
-                for (const auto& s: waypoint_vector) {
-                    this->debug_sent_fk.push_back(s);
-                }
+
+            for (const auto& s: waypoint_vector) {
+                this->debug_insert_one_q(this->debug_sent_wayp_mutex, this->debug_sent_wayp, s);
             }
 
             const auto p = this->now().seconds() - now;
-
-            this->canbus_timeq_mutex.lock();
-            if (this->canbus_timeq.size() >= 10000) {
-                this->canbus_timeq.pop_front();
-            }
-            this->canbus_timeq.push_back(p);
-            this->canbus_timeq_mutex.unlock();
 
             std::lock_guard<std::mutex> lock_size(this->last_estimated_point_size_mutex);
             this->last_estimated_point_size += uint16_t(waypoint_vector.size());
             this->last_sent_aubo_point = pre_sent_point;
             this->last_sent_aubo_point_vel = pre_sent_vel;
+            this->last_sent_aubo_point_acc = pre_sent_acc;
             this->last_sent_aubo_point_id++; // of no use at all
 
             // {

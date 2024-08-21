@@ -26,7 +26,7 @@ ik_moveit_left:
     # max vel and max acc
     joints_deg_max_vel: [150.0, 150.0, 150.0, 240.0, 240.0, 240.0]
     joints_deg_max_acc: [200.0, 200.0, 200.0, 250.0, 250.0, 250.0]
-    # joints_deg_max_acc: [200000.0, 200000.0, 200000.0, 250000.0, 250000.0, 250000.0]
+    joints_deg_max_jerk: [20000.0, 20000.0, 20000.0, 20000.0, 20000.0, 20000.0]
     joints_jump_deg: 40.0
     joints_jump_limit_rate: 0.03
     control_deg_eps: 0.001
@@ -49,8 +49,6 @@ ik_moveit_left:
     launchtime_debug_queue_size: 5000
     # [aubo ip]
     aubo_service_port: 8899
-    # [record]
-    record_vr_file: "vr1.txt"
 
 
 /**:
